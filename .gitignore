@@ -1,0 +1,5 @@
+.gocache/
+dist/
+result.csv
+result.json
+*.exe
