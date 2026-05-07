@@ -32,6 +32,8 @@ hostcollision -g
 
 The GUI starts a local web interface and opens it in the default browser. If the browser does not open automatically, copy the printed local URL into a browser.
 
+IP and domain lists can be pasted directly or loaded from local text files with the upload buttons in the GUI.
+
 ## CLI
 
 IP to domain:
@@ -69,3 +71,7 @@ hostcollision -m ip2domain -i ips.txt -d domains.txt -t 50 -q 20 -p 80,443,8080 
 ## Notes
 
 Use this tool only for authorized testing. Keep QPS and thread counts within limits that the target environment permits.
+
+## Disclaimer
+
+This project is provided for authorized security testing, asset verification, and defensive research only. Do not use it against systems you do not own or do not have explicit permission to test. The authors and contributors are not responsible for misuse, service disruption, data loss, legal consequences, or any other damage caused by this tool.

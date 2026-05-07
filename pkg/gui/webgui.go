@@ -216,6 +216,17 @@ const indexHTML = `<!doctype html>
       gap: 7px;
       margin-bottom: 14px;
     }
+    .field-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .field-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
     .grid {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -264,6 +275,11 @@ const indexHTML = `<!doctype html>
       font: inherit;
       font-weight: 650;
       cursor: pointer;
+    }
+    button.small {
+      min-height: 30px;
+      padding: 0 10px;
+      font-size: 12px;
     }
     button.primary {
       flex: 1;
@@ -335,6 +351,13 @@ const indexHTML = `<!doctype html>
       color: var(--warn);
       overflow-wrap: anywhere;
     }
+    .file-input {
+      position: absolute;
+      inline-size: 1px;
+      block-size: 1px;
+      opacity: 0;
+      pointer-events: none;
+    }
     @media (max-width: 860px) {
       header {
         align-items: flex-start;
@@ -354,6 +377,10 @@ const indexHTML = `<!doctype html>
       .grid {
         grid-template-columns: 1fr;
       }
+      .field-head {
+        align-items: flex-start;
+        flex-direction: column;
+      }
     }
   </style>
 </head>
@@ -372,13 +399,27 @@ const indexHTML = `<!doctype html>
         </select>
       </div>
       <div class="field">
-        <label for="ips">IP List</label>
+        <div class="field-head">
+          <label for="ips">IP List</label>
+          <div class="field-actions">
+            <button id="load-ips" class="small" type="button">Upload</button>
+            <button id="clear-ips" class="small" type="button">Clear</button>
+          </div>
+        </div>
+        <input id="ips-file" class="file-input" type="file" accept=".txt,.csv,text/plain,text/csv">
         <textarea id="ips" spellcheck="false">192.168.1.1
 10.0.0.1
 8.8.8.8</textarea>
       </div>
       <div class="field">
-        <label for="domains">Domain List</label>
+        <div class="field-head">
+          <label for="domains">Domain List</label>
+          <div class="field-actions">
+            <button id="load-domains" class="small" type="button">Upload</button>
+            <button id="clear-domains" class="small" type="button">Clear</button>
+          </div>
+        </div>
+        <input id="domains-file" class="file-input" type="file" accept=".txt,.csv,text/plain,text/csv">
         <textarea id="domains" spellcheck="false">example.com
 test.com
 demo.com</textarea>
@@ -440,7 +481,13 @@ demo.com</textarea>
     const els = {
       mode: document.getElementById('mode'),
       ips: document.getElementById('ips'),
+      ipsFile: document.getElementById('ips-file'),
+      loadIps: document.getElementById('load-ips'),
+      clearIps: document.getElementById('clear-ips'),
       domains: document.getElementById('domains'),
+      domainsFile: document.getElementById('domains-file'),
+      loadDomains: document.getElementById('load-domains'),
+      clearDomains: document.getElementById('clear-domains'),
       threads: document.getElementById('threads'),
       qps: document.getElementById('qps'),
       timeout: document.getElementById('timeout'),
@@ -456,12 +503,14 @@ demo.com</textarea>
       csv: document.getElementById('download-csv'),
     };
     let lastResults = [];
+    const loadedFiles = { ips: '', domains: '' };
+    const maxPreviewChars = 20000;
 
     function payload() {
       return {
         mode: els.mode.value,
-        ips: els.ips.value,
-        domains: els.domains.value,
+        ips: sourceText('ips', els.ips),
+        domains: sourceText('domains', els.domains),
         threads: Number(els.threads.value),
         qps: Number(els.qps.value),
         timeout: Number(els.timeout.value),
@@ -526,6 +575,41 @@ demo.com</textarea>
       }).join(',')).join('\n');
     }
 
+    function lineCount(text) {
+      return text.split(/\r?\n/).map(line => line.trim()).filter(line => line && !line.startsWith('#')).length;
+    }
+
+    function sourceText(kind, target) {
+      return loadedFiles[kind] || target.value;
+    }
+
+    function previewText(text) {
+      if (text.length <= maxPreviewChars) {
+        return text;
+      }
+      return text.slice(0, maxPreviewChars) + '\n\n# Preview truncated. The full uploaded file will be used for scanning.';
+    }
+
+    function readFileInto(fileInput, target, label, kind) {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) {
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        const text = String(reader.result || '');
+        loadedFiles[kind] = text;
+        target.value = previewText(text);
+        els.status.textContent = label + ': ' + lineCount(text) + ' lines';
+        fileInput.value = '';
+      };
+      reader.onerror = () => {
+        els.status.textContent = 'Failed to read ' + file.name;
+        fileInput.value = '';
+      };
+      reader.readAsText(file);
+    }
+
     els.scan.addEventListener('click', async () => {
       els.scan.disabled = true;
       els.status.textContent = 'Scanning';
@@ -553,6 +637,27 @@ demo.com</textarea>
     els.clear.addEventListener('click', () => {
       render([]);
       els.status.textContent = 'Ready';
+    });
+
+    els.loadIps.addEventListener('click', () => els.ipsFile.click());
+    els.loadDomains.addEventListener('click', () => els.domainsFile.click());
+    els.ipsFile.addEventListener('change', () => readFileInto(els.ipsFile, els.ips, 'IP list', 'ips'));
+    els.domainsFile.addEventListener('change', () => readFileInto(els.domainsFile, els.domains, 'Domain list', 'domains'));
+    els.ips.addEventListener('input', () => {
+      loadedFiles.ips = '';
+    });
+    els.domains.addEventListener('input', () => {
+      loadedFiles.domains = '';
+    });
+    els.clearIps.addEventListener('click', () => {
+      loadedFiles.ips = '';
+      els.ips.value = '';
+      els.status.textContent = 'IP list cleared';
+    });
+    els.clearDomains.addEventListener('click', () => {
+      loadedFiles.domains = '';
+      els.domains.value = '';
+      els.status.textContent = 'Domain list cleared';
     });
 
     els.json.addEventListener('click', () => {
