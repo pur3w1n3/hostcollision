@@ -82,6 +82,14 @@ hostcollision -m ip2domain -i ips.txt -d domains.txt -t 50 -q 20 -p 80,443,8080 
 - 在 Windows、Linux、macOS 上运行 `go test ./...`
 - 构建 Windows amd64、Linux amd64、Linux arm64、macOS amd64、macOS arm64 产物
 - 自动上传构建产物到 workflow artifacts
+- 推送 `v*` 标签时自动创建 GitHub Release，并上传三端二进制文件和 `SHA256SUMS.txt`
+
+发布新版本：
+
+```bash
+git tag v0.0.1
+git push origin v0.0.1
+```
 
 ## English Quick Start
 

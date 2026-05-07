@@ -5,13 +5,19 @@ on:
     branches:
       - main
       - master
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   test:
     name: Test on ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -22,10 +28,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -40,6 +46,7 @@ jobs:
     name: Build ${{ matrix.name }}
     runs-on: ubuntu-latest
     needs: test
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -67,10 +74,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
           cache: true
@@ -86,8 +93,62 @@ jobs:
         run: go build -trimpath -ldflags="-s -w" -o dist/${{ matrix.name }}/${{ matrix.binary }} ./cmd
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hostcollision-${{ matrix.name }}
           path: dist/${{ matrix.name }}/${{ matrix.binary }}
           if-no-files-found: error
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          build() {
+            local goos="$1"
+            local goarch="$2"
+            local output="$3"
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" \
+              go build -trimpath -ldflags="-s -w" -o "dist/$output" ./cmd
+          }
+
+          build windows amd64 hostcollision-windows-amd64.exe
+          build linux amd64 hostcollision-linux-amd64
+          build linux arm64 hostcollision-linux-arm64
+          build darwin amd64 hostcollision-macos-amd64
+          build darwin arm64 hostcollision-macos-arm64
+
+          sha256sum dist/* > dist/SHA256SUMS.txt
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG_NAME" \
+            --notes "Automated release for $TAG_NAME."
