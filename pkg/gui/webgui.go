@@ -16,8 +16,9 @@ import (
 
 type scanRequest struct {
 	IPs     string `json:"ips"`
-	Domains string `json:"domains"`
-	Mode    string `json:"mode"`
+	Hosts   string `json:"hosts"`
+	Path    string `json:"path"`
+	Headers string `json:"headers"`
 	Threads int    `json:"threads"`
 	QPS     int    `json:"qps"`
 	Timeout int    `json:"timeout"`
@@ -84,30 +85,33 @@ func serveScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	parsedHeaders, err := scanner.ParseHeaders(parseLines(req.Headers))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	config := &scanner.Config{
 		Threads: req.Threads,
 		QPS:     req.QPS,
 		Timeout: req.Timeout,
 		Ports:   scanner.ParsePorts(req.Ports),
+		Path:    req.Path,
+		Headers: parsedHeaders,
 	}
 	scn := scanner.NewScanner(config)
 
-	ips := parseLines(req.IPs)
-	domains := parseLines(req.Domains)
-
-	switch req.Mode {
-	case "ip2domain":
-		for _, ip := range ips {
-			scn.ScanIPToDomains(ip, domains)
-		}
-	case "domain2ip":
-		for _, domain := range domains {
-			scn.ScanDomainToIPs(domain, ips)
-		}
-	default:
-		http.Error(w, "invalid mode", http.StatusBadRequest)
+	ips, err := scanner.ExpandIPInputs(parseLines(req.IPs))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	hosts := parseLines(req.Hosts)
+	if len(ips) == 0 || len(hosts) == 0 {
+		http.Error(w, "at least one IP and one host header/domain are required", http.StatusBadRequest)
+		return
+	}
+	scn.ScanTargets(ips, hosts)
 
 	results := scn.GetResults()
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -392,15 +396,8 @@ const indexHTML = `<!doctype html>
   <main>
     <aside>
       <div class="field">
-        <label for="mode">Mode</label>
-        <select id="mode">
-          <option value="ip2domain">IP to Domain</option>
-          <option value="domain2ip">Domain to IP</option>
-        </select>
-      </div>
-      <div class="field">
         <div class="field-head">
-          <label for="ips">IP List</label>
+          <label for="ips">Target IPs</label>
           <div class="field-actions">
             <button id="load-ips" class="small" type="button">Upload</button>
             <button id="clear-ips" class="small" type="button">Clear</button>
@@ -413,16 +410,26 @@ const indexHTML = `<!doctype html>
       </div>
       <div class="field">
         <div class="field-head">
-          <label for="domains">Domain List</label>
+          <label for="hosts">Host Headers / Domains / URLs</label>
           <div class="field-actions">
-            <button id="load-domains" class="small" type="button">Upload</button>
-            <button id="clear-domains" class="small" type="button">Clear</button>
+            <button id="load-hosts" class="small" type="button">Upload</button>
+            <button id="clear-hosts" class="small" type="button">Clear</button>
           </div>
         </div>
-        <input id="domains-file" class="file-input" type="file" accept=".txt,.csv,text/plain,text/csv">
-        <textarea id="domains" spellcheck="false">example.com
+        <input id="hosts-file" class="file-input" type="file" accept=".txt,.csv,text/plain,text/csv">
+        <textarea id="hosts" spellcheck="false">example.com
+example.com/admin
+https://test.com/login?a=1
 test.com
 demo.com</textarea>
+      </div>
+      <div class="field">
+        <label for="path">Optional URL Path</label>
+        <input id="path" placeholder="/login?a=1 or https://example.com/login?a=1">
+      </div>
+      <div class="field">
+        <label for="headers">Headers</label>
+        <textarea id="headers" spellcheck="false" placeholder="User-Agent: custom&#10;X-Forwarded-For: 127.0.0.1"></textarea>
       </div>
       <div class="grid">
         <div class="field">
@@ -464,6 +471,9 @@ demo.com</textarea>
               <th>IP</th>
               <th>Port</th>
               <th>Host</th>
+              <th>Path</th>
+              <th>URL</th>
+              <th>User-Agent</th>
               <th>Status</th>
               <th>Title</th>
               <th>Length</th>
@@ -479,15 +489,16 @@ demo.com</textarea>
   </main>
   <script>
     const els = {
-      mode: document.getElementById('mode'),
       ips: document.getElementById('ips'),
       ipsFile: document.getElementById('ips-file'),
       loadIps: document.getElementById('load-ips'),
       clearIps: document.getElementById('clear-ips'),
-      domains: document.getElementById('domains'),
-      domainsFile: document.getElementById('domains-file'),
-      loadDomains: document.getElementById('load-domains'),
-      clearDomains: document.getElementById('clear-domains'),
+      hosts: document.getElementById('hosts'),
+      hostsFile: document.getElementById('hosts-file'),
+      loadHosts: document.getElementById('load-hosts'),
+      clearHosts: document.getElementById('clear-hosts'),
+      path: document.getElementById('path'),
+      headers: document.getElementById('headers'),
       threads: document.getElementById('threads'),
       qps: document.getElementById('qps'),
       timeout: document.getElementById('timeout'),
@@ -503,14 +514,15 @@ demo.com</textarea>
       csv: document.getElementById('download-csv'),
     };
     let lastResults = [];
-    const loadedFiles = { ips: '', domains: '' };
+    const loadedFiles = { ips: '', hosts: '' };
     const maxPreviewChars = 20000;
 
     function payload() {
       return {
-        mode: els.mode.value,
         ips: sourceText('ips', els.ips),
-        domains: sourceText('domains', els.domains),
+        hosts: sourceText('hosts', els.hosts),
+        path: els.path.value,
+        headers: els.headers.value,
         threads: Number(els.threads.value),
         qps: Number(els.qps.value),
         timeout: Number(els.timeout.value),
@@ -538,6 +550,9 @@ demo.com</textarea>
           '<td>' + escapeText(row.ip) + '</td>' +
           '<td>' + escapeText(row.port) + '</td>' +
           '<td>' + escapeText(row.host) + '</td>' +
+          '<td>' + escapeText(row.path) + '</td>' +
+          '<td>' + escapeText(row.url) + '</td>' +
+          '<td>' + escapeText(row.user_agent) + '</td>' +
           '<td>' + escapeText(row.status_code) + '</td>' +
           '<td>' + escapeText(row.title) + '</td>' +
           '<td>' + escapeText(row.content_length) + '</td>' +
@@ -567,8 +582,8 @@ demo.com</textarea>
     }
 
     function toCSV(results) {
-      const header = ['IP','Port','Host','StatusCode','Title','ContentLength','Server','ResponseTime(ms)','IsValid','Error'];
-      const rows = results.map(r => [r.ip, r.port, r.host, r.status_code, r.title, r.content_length, r.server, r.response_time_ms, r.is_valid, r.error]);
+      const header = ['IP','Port','Host','Input','Path','URL','StatusCode','Title','ContentLength','Server','UserAgent','ResponseTime(ms)','IsValid','Error'];
+      const rows = results.map(r => [r.ip, r.port, r.host, r.input, r.path, r.url, r.status_code, r.title, r.content_length, r.server, r.user_agent, r.response_time_ms, r.is_valid, r.error]);
       return [header, ...rows].map(row => row.map(cell => {
         const value = String(cell ?? '');
         return '"' + value.replace(/"/g, '""') + '"';
@@ -640,24 +655,24 @@ demo.com</textarea>
     });
 
     els.loadIps.addEventListener('click', () => els.ipsFile.click());
-    els.loadDomains.addEventListener('click', () => els.domainsFile.click());
+    els.loadHosts.addEventListener('click', () => els.hostsFile.click());
     els.ipsFile.addEventListener('change', () => readFileInto(els.ipsFile, els.ips, 'IP list', 'ips'));
-    els.domainsFile.addEventListener('change', () => readFileInto(els.domainsFile, els.domains, 'Domain list', 'domains'));
+    els.hostsFile.addEventListener('change', () => readFileInto(els.hostsFile, els.hosts, 'Host list', 'hosts'));
     els.ips.addEventListener('input', () => {
       loadedFiles.ips = '';
     });
-    els.domains.addEventListener('input', () => {
-      loadedFiles.domains = '';
+    els.hosts.addEventListener('input', () => {
+      loadedFiles.hosts = '';
     });
     els.clearIps.addEventListener('click', () => {
       loadedFiles.ips = '';
       els.ips.value = '';
       els.status.textContent = 'IP list cleared';
     });
-    els.clearDomains.addEventListener('click', () => {
-      loadedFiles.domains = '';
-      els.domains.value = '';
-      els.status.textContent = 'Domain list cleared';
+    els.clearHosts.addEventListener('click', () => {
+      loadedFiles.hosts = '';
+      els.hosts.value = '';
+      els.status.textContent = 'Host list cleared';
     });
 
     els.json.addEventListener('click', () => {

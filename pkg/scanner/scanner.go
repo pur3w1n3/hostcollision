@@ -9,7 +9,6 @@ import (
 // Scanner coordinates collision probing.
 type Scanner struct {
 	config      *Config
-	resolver    *Resolver
 	prober      *Prober
 	limiter     *RateLimiter
 	results     []*CollisionResult
@@ -27,59 +26,40 @@ func NewScanner(config *Config) *Scanner {
 	}
 
 	return &Scanner{
-		config:   config,
-		resolver: NewResolver(config.Timeout),
-		prober:   NewProber(config.Timeout),
-		limiter:  NewRateLimiter(config.QPS),
-		results:  make([]*CollisionResult, 0),
+		config:  config,
+		prober:  NewProberWithHeaders(config.Timeout, config.Headers),
+		limiter: NewRateLimiter(config.QPS),
+		results: make([]*CollisionResult, 0),
 	}
 }
 
-// ScanIPToDomains probes one IP against many host names.
-func (s *Scanner) ScanIPToDomains(ip string, domains []string) {
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, s.config.Threads)
-
-	for _, domain := range domains {
-		for _, port := range s.config.Ports {
-			wg.Add(1)
-			go func(d string, p int) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
-
-				ctx := context.Background()
-				_ = s.limiter.Wait(ctx)
-
-				result := s.prober.Probe(ctx, ip, p, d)
-				s.addResult(result)
-				fmt.Printf("[+] %s:%d -> %s [%d] %dms\n", ip, p, d, result.StatusCode, result.ResponseTime)
-			}(domain, port)
-		}
-	}
-	wg.Wait()
+// ScanTargets probes every IP, host header, and port combination.
+func (s *Scanner) ScanTargets(ips []string, hosts []string) {
+	s.ScanHostTargets(ips, ParseHostTargets(hosts, s.config.Path))
 }
 
-// ScanDomainToIPs probes one host name against many IPs.
-func (s *Scanner) ScanDomainToIPs(domain string, ips []string) {
+// ScanHostTargets probes every IP, parsed host target, and port combination.
+func (s *Scanner) ScanHostTargets(ips []string, targets []HostTarget) {
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, s.config.Threads)
 
 	for _, ip := range ips {
-		for _, port := range s.config.Ports {
-			wg.Add(1)
-			go func(i string, p int) {
-				defer wg.Done()
-				sem <- struct{}{}
-				defer func() { <-sem }()
+		for _, target := range targets {
+			for _, port := range s.config.Ports {
+				wg.Add(1)
+				go func(i string, t HostTarget, p int) {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
 
-				ctx := context.Background()
-				_ = s.limiter.Wait(ctx)
+					ctx := context.Background()
+					_ = s.limiter.Wait(ctx)
 
-				result := s.prober.Probe(ctx, i, p, domain)
-				s.addResult(result)
-				fmt.Printf("[+] %s:%d -> %s [%d] %dms\n", i, p, domain, result.StatusCode, result.ResponseTime)
-			}(ip, port)
+					result := s.prober.Probe(ctx, i, p, t)
+					s.addResult(result)
+					fmt.Printf("[+] %s:%d%s -> Host: %s [%d] %dms\n", i, p, t.Path, t.Host, result.StatusCode, result.ResponseTime)
+				}(ip, target, port)
+			}
 		}
 	}
 	wg.Wait()

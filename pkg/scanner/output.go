@@ -44,7 +44,7 @@ func saveCSV(results []*CollisionResult, filename string) error {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	if err := writer.Write([]string{"IP", "Port", "Host", "StatusCode", "Title", "ContentLength", "Server", "ResponseTime(ms)", "IsValid", "Error"}); err != nil {
+	if err := writer.Write([]string{"IP", "Port", "Host", "Input", "Path", "URL", "StatusCode", "Title", "ContentLength", "Server", "UserAgent", "ResponseTime(ms)", "IsValid", "Error"}); err != nil {
 		return err
 	}
 
@@ -53,10 +53,14 @@ func saveCSV(results []*CollisionResult, filename string) error {
 			r.IP,
 			strconv.Itoa(r.Port),
 			r.Host,
+			r.Input,
+			r.Path,
+			r.URL,
 			strconv.Itoa(r.StatusCode),
 			r.Title,
 			strconv.Itoa(r.ContentLen),
 			r.Server,
+			r.UserAgent,
 			strconv.FormatInt(r.ResponseTime, 10),
 			fmt.Sprintf("%v", r.IsValid),
 			r.Error,
