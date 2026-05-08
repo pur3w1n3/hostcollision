@@ -1,5 +1,19 @@
-.gocache/
-dist/
-result.csv
-result.json
-*.exe
+# Build artifacts
+/hostcollision
+/hostcollision.exe
+/hostcollision-test.exe
+/hostcollision-test.exe~
+
+# Local scan outputs
+/result.csv
+/result.json
+/scan.log
+/timeout.log
+/hostcollision-gui-*.csv
+/*.checkpoint
+
+# Local archives and scratch files
+*.7z
+*.zip
+*.rar
+*.tmp

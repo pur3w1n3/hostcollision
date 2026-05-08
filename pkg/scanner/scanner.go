@@ -8,12 +8,19 @@ import (
 
 // Scanner coordinates collision probing.
 type Scanner struct {
-	config      *Config
-	prober      *Prober
-	limiter     *RateLimiter
-	results     []*CollisionResult
-	mu          sync.Mutex
-	guiCallback func(*CollisionResult)
+	config          *Config
+	prober          *Prober
+	limiter         *RateLimiter
+	results         []*CollisionResult
+	resultCount     int
+	skippedCount    int
+	timeoutCount    int
+	storeResults    bool
+	mu              sync.Mutex
+	resultCallback  func(*CollisionResult)
+	timeoutCallback func(*CollisionResult)
+	logCallback     func(string)
+	skipCallback    func(string, int, HostTarget) bool
 }
 
 // NewScanner creates a scanner.
@@ -26,10 +33,11 @@ func NewScanner(config *Config) *Scanner {
 	}
 
 	return &Scanner{
-		config:  config,
-		prober:  NewProberWithHeaders(config.Timeout, config.Headers),
-		limiter: NewRateLimiter(config.QPS),
-		results: make([]*CollisionResult, 0),
+		config:       config,
+		prober:       NewProberWithHeaders(config.Timeout, config.Headers),
+		limiter:      NewRateLimiter(config.QPS),
+		results:      make([]*CollisionResult, 0),
+		storeResults: true,
 	}
 }
 
@@ -41,43 +49,149 @@ func (s *Scanner) ScanTargets(ips []string, hosts []string) {
 // ScanHostTargets probes every IP, parsed host target, and port combination.
 func (s *Scanner) ScanHostTargets(ips []string, targets []HostTarget) {
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, s.config.Threads)
+	jobs := make(chan probeJob, s.config.Threads)
+
+	for worker := 0; worker < s.config.Threads; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				ctx := context.Background()
+				_ = s.limiter.Wait(ctx)
+
+				result := s.prober.Probe(ctx, job.ip, job.port, job.target)
+				if shouldFilterTimeout(result) {
+					s.addTimeout(result)
+					s.logf("[~] Timeout %s:%d%s -> Host: %s | %s", job.ip, job.port, job.target.Path, job.target.Host, result.Error)
+					continue
+				}
+				s.addResult(result)
+				s.logf("[+] %s:%d%s -> Host: %s [%d] %dms", job.ip, job.port, job.target.Path, job.target.Host, result.StatusCode, result.ResponseTime)
+			}
+		}()
+	}
 
 	for _, ip := range ips {
 		for _, target := range targets {
 			for _, port := range s.config.Ports {
-				wg.Add(1)
-				go func(i string, t HostTarget, p int) {
-					defer wg.Done()
-					sem <- struct{}{}
-					defer func() { <-sem }()
-
-					ctx := context.Background()
-					_ = s.limiter.Wait(ctx)
-
-					result := s.prober.Probe(ctx, i, p, t)
-					s.addResult(result)
-					fmt.Printf("[+] %s:%d%s -> Host: %s [%d] %dms\n", i, p, t.Path, t.Host, result.StatusCode, result.ResponseTime)
-				}(ip, target, port)
+				if s.shouldSkip(ip, port, target) {
+					s.addSkipped()
+					s.logf("[=] Skipped completed %s:%d%s -> Host: %s", ip, port, target.Path, target.Host)
+					continue
+				}
+				jobs <- probeJob{ip: ip, target: target, port: port}
 			}
 		}
 	}
+	close(jobs)
 	wg.Wait()
+}
+
+func (s *Scanner) shouldSkip(ip string, port int, target HostTarget) bool {
+	s.mu.Lock()
+	cb := s.skipCallback
+	s.mu.Unlock()
+
+	return cb != nil && cb(ip, port, target)
+}
+
+func (s *Scanner) addSkipped() {
+	s.mu.Lock()
+	s.skippedCount++
+	s.mu.Unlock()
 }
 
 func (s *Scanner) addResult(result *CollisionResult) {
 	s.mu.Lock()
-	s.results = append(s.results, result)
+	s.resultCount++
+	if s.storeResults {
+		s.results = append(s.results, result)
+	}
+	cb := s.resultCallback
 	s.mu.Unlock()
 
-	if s.guiCallback != nil {
-		s.guiCallback(result)
+	if cb != nil {
+		cb(result)
 	}
+}
+
+func (s *Scanner) addTimeout(result *CollisionResult) {
+	s.mu.Lock()
+	s.timeoutCount++
+	cb := s.timeoutCallback
+	s.mu.Unlock()
+
+	if cb != nil {
+		cb(result)
+	}
+}
+
+func (s *Scanner) logf(format string, args ...any) {
+	s.mu.Lock()
+	cb := s.logCallback
+	s.mu.Unlock()
+
+	if cb != nil {
+		cb(fmt.Sprintf(format, args...))
+	}
+}
+
+func shouldFilterTimeout(result *CollisionResult) bool {
+	return result != nil && result.StatusCode == 0 && result.IsTimeout
+}
+
+type probeJob struct {
+	ip     string
+	target HostTarget
+	port   int
+}
+
+// SetResultCallback registers a callback invoked for each result.
+func (s *Scanner) SetResultCallback(cb func(*CollisionResult)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.resultCallback = cb
+}
+
+// SetTimeoutCallback registers a callback invoked for timeout probes filtered out of results.
+func (s *Scanner) SetTimeoutCallback(cb func(*CollisionResult)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.timeoutCallback = cb
+}
+
+// SetLogCallback registers a callback invoked for scanner log lines.
+func (s *Scanner) SetLogCallback(cb func(string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.logCallback = cb
+}
+
+// SetSkipCallback registers a callback that decides whether a probe should be skipped.
+func (s *Scanner) SetSkipCallback(cb func(string, int, HostTarget) bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.skipCallback = cb
 }
 
 // SetGUICallback registers a callback invoked for each result.
 func (s *Scanner) SetGUICallback(cb func(*CollisionResult)) {
-	s.guiCallback = cb
+	s.SetResultCallback(cb)
+}
+
+// SetStoreResults controls whether results are retained in memory.
+func (s *Scanner) SetStoreResults(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.storeResults = enabled
+	if !enabled {
+		s.results = nil
+	}
 }
 
 // GetResults returns all collected results.
@@ -88,4 +202,28 @@ func (s *Scanner) GetResults() []*CollisionResult {
 	results := make([]*CollisionResult, len(s.results))
 	copy(results, s.results)
 	return results
+}
+
+// GetResultCount returns the number of completed probes.
+func (s *Scanner) GetResultCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.resultCount
+}
+
+// GetSkippedCount returns the number of skipped probes.
+func (s *Scanner) GetSkippedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.skippedCount
+}
+
+// GetTimeoutCount returns the number of timeout probes filtered out of results.
+func (s *Scanner) GetTimeoutCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.timeoutCount
 }

@@ -1,42 +1,25 @@
 # Host Collision
 
-Host Collision 是一个 Host Header 碰撞扫描工具。它会连接目标 `IP:Port`，设置候选 `Host` 请求头，并记录不同 Host Header 下的 HTTP / HTTPS 响应差异。
+## 中文说明
 
-Host Collision is a host-header collision scanner. It probes target `IP:Port` combinations with candidate `Host` headers and records HTTP / HTTPS responses.
+Host Collision 是一个 Host Header 碰撞扫描工具。它会连接目标 `IP:Port`，同时设置候选 `Host` 请求头，记录不同 Host Header 下的 HTTP/HTTPS 响应。
 
-## 功能特性
+### 功能特性
 
-- 单一清晰的扫描模型：`Target IPs x Host Headers/URLs x Ports`
-- 支持真实 HTTP / HTTPS GET 探测，并设置自定义 Host Header
+- 扫描模型为 `目标 IP x Host Header/URL x 端口`
+- IP 输入支持单 IP、CIDR、范围和通配符
+- Host 输入支持域名、域名路径和完整 URL
+- Host 输入为 URL 时会保留 path/query
+- 支持 `-H "Name: value"` 自定义请求头
 - 支持并发线程数和 QPS 控制
-- 支持随机常见浏览器 User-Agent
-- 支持 `-H "Name: value"` 自定义请求头；自定义 `User-Agent` 会覆盖随机 UA
-- Host 输入支持裸域名、域名路径和完整 URL
-- 支持全局 URL 路径；当 Host 输入没有自带路径时，会自动拼接该路径
-- IP 输入支持单 IP、CIDR、范围和通配段
-- 支持 CSV / JSON 结果导出
-- GUI 支持 Windows、Linux、macOS 三端打开
-- GUI 支持通过文件导入大 IP / Host 列表
-- GitHub Actions 自动测试、构建，并在 tag 发布时上传 Release 产物
+- CLI 扫描时流式写入结果文件
+- 支持 CSV / JSON 输出
+- CLI CSV 扫描支持 checkpoint / resume
+- 无状态码且超时的探测不会进入正常结果
+- timeout/no-status 探测会写入独立 timeout 日志
+- GUI 支持实时结果、表头排序、任务 ID、刷新恢复和每任务 CSV 自动保存
 
-## 工作原理
-
-每次扫描都会真实发起 HTTP 或 HTTPS 请求到目标 IP：
-
-```text
-GET http://1.2.3.4:80/login?a=1
-Host: example.com
-User-Agent: <random or custom>
-```
-
-如果 Host 输入为完整 URL，例如 `https://example.com/admin?a=1`，工具会提取：
-
-- Host Header: `example.com`
-- Request Path: `/admin?a=1`
-
-最终请求仍然连接目标 IP，而不是连接 URL 中的域名。
-
-## 编译
+### 编译
 
 ```bash
 go mod download
@@ -49,51 +32,39 @@ Windows:
 go build -trimpath -ldflags="-s -w" -o hostcollision.exe .\cmd
 ```
 
-## GUI 使用
+### GUI 使用
 
 ```bash
 hostcollision -g
 ```
 
-程序会启动一个本地 Web GUI，并自动用默认浏览器打开。如果浏览器没有自动打开，把终端里打印的本地 URL 复制到浏览器即可。
+GUI 会启动本地 Web 服务并自动打开浏览器。
 
-GUI 中的 `Target IPs` 和 `Host Headers / Domains / URLs` 支持两种输入方式：
+GUI 行为：
 
-- 直接粘贴文本
-- 点击 Upload 按钮读取本地 `.txt` / `.csv` 文件
+- 当前任务 ID 会显示在 `Host Collision` 旁边。
+- 浏览器 URL 会自动更新为 `?id=<task-id>`。
+- 刷新页面后，只要 GUI 进程仍在运行，就会自动重连该任务。
+- 正常结果会边扫边保存到 `hostcollision-gui-<task-id>.csv`。
+- timeout/no-status 不显示在结果表中，会写入 `timeout.log`。
+- 点击结果表头可以排序。
 
-上传大文件时，界面只显示前一部分预览，扫描时仍会使用完整文件内容，避免超大文本直接塞入输入框导致浏览器卡顿。
+刷新恢复依赖 GUI 进程仍在运行。如果进程退出，浏览器无法恢复内存任务，但已经落盘的 CSV 仍然可用。
 
-`Optional URL Path` 可以填写 `/login?a=1` 或 `https://example.com/login?a=1`。如果 Host 输入为 `example.com`，扫描会请求 `http://IP:Port/login?a=1` 并设置 `Host: example.com`；如果 Host 输入本身已经是 `example.com/admin`，则优先使用输入里的 `/admin`。
+### CLI 使用
 
-`Headers` 每行一个请求头，例如：
-
-```text
-User-Agent: custom
-X-Forwarded-For: 127.0.0.1
-```
-
-## CLI 使用
-
-从文件读取 IP 和 Host 列表：
+从文件读取 IP 和 Host：
 
 ```bash
 hostcollision -i examples/ips.txt -d examples/domains.txt
 ```
 
-输出 JSON：
-
-```bash
-hostcollision -i examples/ips.txt -d examples/domains.txt -o result.json
-```
-
-单个或多个命令行输入：
+命令行直接输入：
 
 ```bash
 hostcollision --ip 192.168.1.10 --host example.com
 hostcollision --ip 192.168.1.10 --host example.com/admin
 hostcollision --ip 192.168.1.10 --host https://example.com/login?a=1
-hostcollision --ip 192.168.1.10 --ip 192.168.1.11 --host example.com --host test.com
 ```
 
 IP 段输入：
@@ -104,11 +75,11 @@ hostcollision --ip 192.168.1.1-20 --host example.com
 hostcollision --ip 192.168.1.* --host example.com
 ```
 
-给多个 Host 统一拼接 URL 路径：
+给未自带路径的 Host 设置默认路径：
 
 ```bash
-hostcollision -i examples/ips.txt -d examples/domains.txt --path /login?a=1
-hostcollision --ip 192.168.1.10 --host example.com --host test.com --url-path https://demo.local/admin
+hostcollision -i ips.txt -d hosts.txt --path /login?a=1
+hostcollision --ip 192.168.1.10 --host example.com --url-path https://demo.local/admin
 ```
 
 自定义请求头：
@@ -117,79 +88,214 @@ hostcollision --ip 192.168.1.10 --host example.com --host test.com --url-path ht
 hostcollision --ip 192.168.1.10 --host example.com -H "User-Agent: custom" -H "X-Forwarded-For: 127.0.0.1"
 ```
 
-自定义扫描参数：
+调整扫描参数：
 
 ```bash
 hostcollision -i ips.txt -d hosts.txt -t 50 -q 20 -p 80,443,8080 -o result.csv
 ```
 
-## 参数说明
+### 断点继续
 
-| 参数 | 简写 | 默认值 | 说明 |
-| --- | --- | --- | --- |
-| `--gui` | `-g` | `false` | 启动 GUI 模式 |
-| `--threads` | `-t` | `20` | 并发 worker 数 |
-| `--qps` | `-q` | `30` | 每秒请求数 |
-| `--timeout` | `-T` | `5` | 请求超时时间，单位秒 |
-| `--ports` | `-p` | `80,443,8080,8443` | 逗号分隔的端口列表 |
-| `--path` | 无 | 空 | 给未自带路径的 Host 拼接请求路径或 URL 路径 |
-| `--url-path` | 无 | 空 | `--path` 的别名 |
-| `--output` | `-o` | `result.csv` | 输出文件路径，支持 `.csv` / `.json` |
-| `--ip-file` | `-i` | 空 | 目标 IP 列表文件，支持 IP 段 |
-| `--host-file` | `-d` | 空 | Host Header / 域名 / URL 列表文件 |
-| `--ip` | 无 | 空 | 单个目标 IP / CIDR / 范围 / 通配段，可重复传参 |
-| `--host` | 无 | 空 | 单个 Host Header / 域名 / URL，可重复传参 |
-| `--header` | `-H` | 空 | 自定义请求头，格式 `Name: value`，可重复传参 |
+CLI 会把已完成探测写入 checkpoint 文件。默认路径为 `<output>.checkpoint`。
 
-## GitHub Actions
-
-仓库内置 `.github/workflows/build.yml`：
-
-- 在 Windows、Linux、macOS 上运行 `go test ./...`
-- 构建 Windows amd64、Linux amd64、Linux arm64、macOS amd64、macOS arm64 产物
-- 自动上传构建产物到 workflow artifacts
-- 推送 `v*` 标签时自动创建 GitHub Release，并上传三端二进制文件和 `SHA256SUMS.txt`
-
-发布新版本：
+继续 CSV 扫描：
 
 ```bash
-git tag v0.0.1
-git push origin v0.0.1
+hostcollision -i ips.txt -d hosts.txt -o result.csv --resume
 ```
+
+指定 checkpoint：
+
+```bash
+hostcollision -i ips.txt -d hosts.txt -o result.csv --checkpoint scan.checkpoint --resume
+```
+
+说明：
+
+- resume 会追加写入 CSV。
+- JSON 输出不支持 resume 追加，因为 JSON 数组无法安全追加。
+- timeout/no-status 探测也会写入 checkpoint，继续扫描时不会重复探测。
+
+### 输出文件
+
+CLI 默认文件：
+
+- 正常结果：`result.csv`
+- 扫描日志：`scan.log`
+- timeout/no-status 日志：`timeout.log`
+- checkpoint：`<output>.checkpoint`
+
+GUI 默认文件：
+
+- 正常结果：`hostcollision-gui-<task-id>.csv`
+- timeout/no-status 日志：`timeout.log`
+
+timeout/no-status 会从正常 CSV/JSON 结果中排除。
+
+### 安全说明
+
+本工具仅用于授权安全测试、资产核验和防御性研究。不要扫描未获得明确授权的系统。
+
+---
 
 ## English
 
-Host Collision sends real HTTP/HTTPS GET requests to target IPs while setting candidate Host headers. Host inputs may be bare domains, domain paths, or full URLs. If a full URL is provided, the hostname is used as the Host header and the URL path/query is preserved for probing.
+Host Collision is a Host header collision scanner. It probes target `IP:Port` combinations with candidate `Host` headers and records HTTP/HTTPS responses.
 
-Quick start:
+## Features
+
+- Scans `Target IPs x Host headers/URLs x Ports`
+- Supports single IP, CIDR, range, and wildcard IP inputs
+- Supports Host inputs as domains, domain paths, or full URLs
+- Preserves path/query from Host URL inputs
+- Supports custom headers with `-H "Name: value"`
+- Controls concurrency and QPS
+- Streams CLI output to result files while scanning
+- Supports CSV and JSON output
+- Supports checkpoint/resume for CLI CSV scans
+- Filters timeout/no-status probes out of normal results
+- Writes timeout/no-status probes to a separate timeout log
+- Provides a local browser GUI with live results, sortable columns, task IDs, refresh recovery, and per-task CSV persistence
+
+## Build
 
 ```bash
 go mod download
 go build -trimpath -ldflags="-s -w" -o hostcollision ./cmd
-hostcollision -g
-hostcollision -i examples/ips.txt -d examples/domains.txt
-hostcollision --ip 192.168.1.10 --host example.com -H "User-Agent: custom"
 ```
 
-Supported IP input formats:
+Windows:
 
-- Single IP: `192.168.1.10`
-- CIDR: `192.168.1.0/24`
-- Range: `192.168.1.1-20`
-- Wildcard: `192.168.1.*`
+```powershell
+go build -trimpath -ldflags="-s -w" -o hostcollision.exe .\cmd
+```
 
-## 注意事项
+## GUI Usage
 
-- 仅用于授权测试、资产核验和防御性安全研究。
-- 根据目标环境承受能力合理设置 QPS 和线程数。
-- 不要对未授权目标进行扫描。
+```bash
+hostcollision -g
+```
 
-## 免责声明
+The GUI starts a local web server and opens your default browser.
 
-本项目仅供授权安全测试、资产验证和防御性研究使用。请勿将其用于任何未获得明确授权的系统、网络或服务。因使用或滥用本工具造成的服务中断、数据损失、法律责任或其他后果，均由使用者自行承担，项目作者和贡献者不承担任何责任。
+GUI behavior:
 
-This project is provided for authorized security testing, asset verification, and defensive research only. Do not use it against systems you do not own or do not have explicit permission to test. The authors and contributors are not responsible for misuse, service disruption, data loss, legal consequences, or any other damage caused by this tool.
+- The current task ID is shown next to `Host Collision`.
+- The browser URL is updated to `?id=<task-id>`.
+- Refreshing the page reconnects to the in-memory task while the GUI process is still running.
+- Normal results are saved while scanning to `hostcollision-gui-<task-id>.csv`.
+- Timeout/no-status probes are not shown in the result table and are written to `timeout.log`.
+- Result columns can be sorted by clicking table headers.
 
-## Star History
+Refresh recovery depends on the GUI process still running. If the process exits, the browser task cannot reconnect, but the CSV file already written to disk remains available.
 
-[![Star History Chart](https://api.star-history.com/svg?repos=pur3w1n3/hostcollision&type=Date)](https://star-history.com/#pur3w1n3/hostcollision&Date)
+## CLI Usage
+
+Read IPs and hosts from files:
+
+```bash
+hostcollision -i examples/ips.txt -d examples/domains.txt
+```
+
+Use inline inputs:
+
+```bash
+hostcollision --ip 192.168.1.10 --host example.com
+hostcollision --ip 192.168.1.10 --host example.com/admin
+hostcollision --ip 192.168.1.10 --host https://example.com/login?a=1
+```
+
+Use IP ranges:
+
+```bash
+hostcollision --ip 192.168.1.0/24 --host example.com
+hostcollision --ip 192.168.1.1-20 --host example.com
+hostcollision --ip 192.168.1.* --host example.com
+```
+
+Set a default path for hosts that do not include one:
+
+```bash
+hostcollision -i ips.txt -d hosts.txt --path /login?a=1
+hostcollision --ip 192.168.1.10 --host example.com --url-path https://demo.local/admin
+```
+
+Set custom headers:
+
+```bash
+hostcollision --ip 192.168.1.10 --host example.com -H "User-Agent: custom" -H "X-Forwarded-For: 127.0.0.1"
+```
+
+Tune scan parameters:
+
+```bash
+hostcollision -i ips.txt -d hosts.txt -t 50 -q 20 -p 80,443,8080 -o result.csv
+```
+
+## Resume and Checkpoints
+
+CLI scans write completed probe keys to a checkpoint file. By default the checkpoint path is `<output>.checkpoint`.
+
+Resume a CSV scan:
+
+```bash
+hostcollision -i ips.txt -d hosts.txt -o result.csv --resume
+```
+
+Use an explicit checkpoint:
+
+```bash
+hostcollision -i ips.txt -d hosts.txt -o result.csv --checkpoint scan.checkpoint --resume
+```
+
+Notes:
+
+- Resume appends to CSV output.
+- Resume with JSON output is rejected because JSON arrays cannot be safely appended.
+- Timeout/no-status probes are also marked in the checkpoint, so resume does not repeat them.
+
+## Output Files
+
+CLI defaults:
+
+- Normal results: `result.csv`
+- Scan log: `scan.log`
+- Timeout/no-status log: `timeout.log`
+- Checkpoint: `<output>.checkpoint`
+
+GUI defaults:
+
+- Normal results: `hostcollision-gui-<task-id>.csv`
+- Timeout/no-status log: `timeout.log`
+
+Timeout/no-status entries are excluded from normal result CSV/JSON output.
+
+## Options
+
+| Option | Short | Default | Description |
+| --- | --- | --- | --- |
+| `--gui` | `-g` | `false` | Start GUI mode |
+| `--threads` | `-t` | `20` | Concurrent workers |
+| `--qps` | `-q` | `30` | Requests per second |
+| `--timeout` | `-T` | `5` | Request timeout in seconds |
+| `--ports` | `-p` | `80,443,8080,8443` | Comma-separated port list |
+| `--path` | | | Default request path for hosts without a path |
+| `--url-path` | | | Alias for `--path` |
+| `--output` | `-o` | `result.csv` | Output file path, `.csv` or `.json` |
+| `--ip-file` | `-i` | | IP list file |
+| `--host-file` | `-d` | | Host/domain/URL list file |
+| `--ip` | | | Inline IP/CIDR/range/wildcard, repeatable |
+| `--host` | | | Inline Host/domain/URL, repeatable |
+| `--header` | `-H` | | Custom request header, repeatable |
+| `--resume` | | `false` | Resume from checkpoint and append CSV output |
+| `--checkpoint` | | `<output>.checkpoint` | Checkpoint file path |
+| `--log-file` | | `scan.log` | CLI scan log path |
+| `--timeout-log-file` | | `timeout.log` | CLI timeout/no-status log path |
+
+## Safety
+
+Use this tool only for authorized security testing, asset verification, and defensive research. Do not scan systems you do not own or do not have explicit permission to test.
+
+## License
+
+No license file is currently included.

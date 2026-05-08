@@ -18,6 +18,7 @@ type CollisionResult struct {
 	ResponseTime int64     `json:"response_time_ms"`
 	Timestamp    time.Time `json:"timestamp"`
 	IsValid      bool      `json:"is_valid"`
+	IsTimeout    bool      `json:"is_timeout,omitempty"`
 	Error        string    `json:"error,omitempty"`
 }
 

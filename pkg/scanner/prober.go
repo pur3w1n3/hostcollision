@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -82,6 +83,7 @@ func (p *Prober) Probe(ctx context.Context, ip string, port int, target HostTarg
 
 	for _, scheme := range []string{"http", "https"} {
 		requestURL := fmt.Sprintf("%s://%s:%d%s", scheme, ip, port, target.Path)
+		result.URL = requestURL
 		req, err := http.NewRequestWithContext(ctx, "GET", requestURL, nil)
 		if err != nil {
 			continue
@@ -99,6 +101,7 @@ func (p *Prober) Probe(ctx context.Context, ip string, port int, target HostTarg
 		resp, err := p.client.Do(req)
 		if err != nil {
 			result.Error = err.Error()
+			result.IsTimeout = isTimeoutError(err)
 			continue
 		}
 
@@ -119,6 +122,18 @@ func (p *Prober) Probe(ctx context.Context, ip string, port int, target HostTarg
 
 	result.ResponseTime = time.Since(start).Milliseconds()
 	return result
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "timeout")
 }
 
 func ParseHostTargets(values []string, defaultPath string) []HostTarget {
