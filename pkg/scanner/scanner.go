@@ -48,6 +48,15 @@ func (s *Scanner) ScanTargets(ips []string, hosts []string) {
 
 // ScanHostTargets probes every IP, parsed host target, and port combination.
 func (s *Scanner) ScanHostTargets(ips []string, targets []HostTarget) {
+	s.ScanHostTargetsContext(context.Background(), ips, targets)
+}
+
+// ScanHostTargetsContext probes every IP, parsed host target, and port combination until done or canceled.
+func (s *Scanner) ScanHostTargetsContext(ctx context.Context, ips []string, targets []HostTarget) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	var wg sync.WaitGroup
 	jobs := make(chan probeJob, s.config.Threads)
 
@@ -55,18 +64,31 @@ func (s *Scanner) ScanHostTargets(ips []string, targets []HostTarget) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for job := range jobs {
-				ctx := context.Background()
-				_ = s.limiter.Wait(ctx)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case job, ok := <-jobs:
+					if !ok {
+						return
+					}
 
-				result := s.prober.Probe(ctx, job.ip, job.port, job.target)
-				if shouldFilterTimeout(result) {
-					s.addTimeout(result)
-					s.logf("[~] Timeout %s:%d%s -> Host: %s | %s", job.ip, job.port, job.target.Path, job.target.Host, result.Error)
-					continue
+					if err := s.limiter.Wait(ctx); err != nil {
+						return
+					}
+
+					result := s.prober.Probe(ctx, job.ip, job.port, job.target)
+					if ctx.Err() != nil {
+						return
+					}
+					if shouldFilterTimeout(result) {
+						s.addTimeout(result)
+						s.logf("[~] Timeout %s:%d%s -> Host: %s | %s", job.ip, job.port, job.target.Path, job.target.Host, result.Error)
+						continue
+					}
+					s.addResult(result)
+					s.logf("[+] %s:%d%s -> Host: %s [%d] %dms", job.ip, job.port, job.target.Path, job.target.Host, result.StatusCode, result.ResponseTime)
 				}
-				s.addResult(result)
-				s.logf("[+] %s:%d%s -> Host: %s [%d] %dms", job.ip, job.port, job.target.Path, job.target.Host, result.StatusCode, result.ResponseTime)
 			}
 		}()
 	}
@@ -74,12 +96,23 @@ func (s *Scanner) ScanHostTargets(ips []string, targets []HostTarget) {
 	for _, ip := range ips {
 		for _, target := range targets {
 			for _, port := range s.config.Ports {
+				if ctx.Err() != nil {
+					close(jobs)
+					wg.Wait()
+					return
+				}
 				if s.shouldSkip(ip, port, target) {
 					s.addSkipped()
 					s.logf("[=] Skipped completed %s:%d%s -> Host: %s", ip, port, target.Path, target.Host)
 					continue
 				}
-				jobs <- probeJob{ip: ip, target: target, port: port}
+				select {
+				case <-ctx.Done():
+					close(jobs)
+					wg.Wait()
+					return
+				case jobs <- probeJob{ip: ip, target: target, port: port}:
+				}
 			}
 		}
 	}

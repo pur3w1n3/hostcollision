@@ -28,6 +28,8 @@ var (
 	checkpoint     string
 	logFile        string
 	timeoutLogFile string
+	guiUser        string
+	guiPassword    string
 	ipValues       []string
 	hostValues     []string
 	headers        []string
@@ -54,6 +56,8 @@ func main() {
 	rootCmd.Flags().StringVar(&checkpoint, "checkpoint", "", "checkpoint file path, defaults to <output>.checkpoint")
 	rootCmd.Flags().StringVar(&logFile, "log-file", "scan.log", "scan log file path")
 	rootCmd.Flags().StringVar(&timeoutLogFile, "timeout-log-file", "timeout.log", "timeout/no-status probe log file path")
+	rootCmd.Flags().StringVar(&guiUser, "gui-user", "", "GUI username for optional Basic Auth")
+	rootCmd.Flags().StringVar(&guiPassword, "gui-password", "", "GUI password for optional Basic Auth")
 	rootCmd.Flags().StringArrayVar(&ipValues, "ip", nil, "target IP, CIDR, range, or wildcard, can be specified multiple times")
 	rootCmd.Flags().StringArrayVar(&hostValues, "host", nil, "host header/domain, can be specified multiple times")
 	rootCmd.Flags().StringArrayVarP(&headers, "header", "H", nil, "custom request header, can be specified multiple times, e.g. -H \"User-Agent: test\"")
@@ -66,7 +70,7 @@ func main() {
 
 func run(cmd *cobra.Command, args []string) {
 	if guiMode {
-		gui.StartNativeGUI()
+		gui.StartNativeGUI(gui.GUIOptions{Username: guiUser, Password: guiPassword})
 		return
 	}
 

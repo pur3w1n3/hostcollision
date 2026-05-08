@@ -3,16 +3,20 @@ package gui
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hostcollision/pkg/scanner"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +32,11 @@ type scanRequest struct {
 	QPS     int    `json:"qps"`
 	Timeout int    `json:"timeout"`
 	Ports   string `json:"ports"`
+}
+
+type GUIOptions struct {
+	Username string
+	Password string
 }
 
 type scanStartResponse struct {
@@ -57,40 +66,69 @@ type scanStatusResponse struct {
 	FinishedAt       *time.Time                 `json:"finished_at,omitempty"`
 }
 
+type scanResultsResponse struct {
+	ID         string                     `json:"id"`
+	Status     string                     `json:"status"`
+	Total      int                        `json:"total"`
+	Count      int                        `json:"count"`
+	Page       int                        `json:"page"`
+	PageSize   int                        `json:"page_size"`
+	TotalPages int                        `json:"total_pages"`
+	Sort       string                     `json:"sort"`
+	Direction  string                     `json:"direction"`
+	ResultFile string                     `json:"result_file"`
+	Results    []*scanner.CollisionResult `json:"results"`
+}
+
 type scanManager struct {
 	mu         sync.Mutex
 	sessions   map[string]*scanSession
 	timeoutLog *guiFileLog
+	guiLog     *guiFileLog
 }
 
 type scanSession struct {
-	mu           sync.Mutex
-	id           string
-	status       string
-	err          string
-	total        int
-	skipped      int
-	results      []*scanner.CollisionResult
-	logs         []string
-	resultFile   string
-	resultWriter *scanner.ResultWriter
-	subscribers  map[chan scanEvent]struct{}
-	startedAt    time.Time
-	finishedAt   *time.Time
+	mu                sync.Mutex
+	id                string
+	status            string
+	err               string
+	total             int
+	skipped           int
+	resultCount       int
+	logs              []string
+	logBaseIndex      int
+	recentResults     []*scanner.CollisionResult
+	recentStartIndex  int
+	resultFile        string
+	resultWriter      *scanner.ResultWriter
+	resultMu          sync.Mutex
+	config            *scanner.Config
+	ips               []string
+	targets           []scanner.HostTarget
+	portCount         int
+	checkpoint        *scanner.Checkpoint
+	checkpointFile    string
+	cancel            context.CancelFunc
+	guiLog            *guiFileLog
+	subscribers       map[chan scanEvent]struct{}
+	lastProgressAt    time.Time
+	lastProgressCount int
+	timeoutLogCount   int
+	lastTimeoutLogAt  time.Time
+	startedAt         time.Time
+	finishedAt        *time.Time
 }
 
 type scanEvent struct {
-	Type        string                   `json:"type"`
-	Status      string                   `json:"status,omitempty"`
-	Error       string                   `json:"error,omitempty"`
-	Total       int                      `json:"total,omitempty"`
-	Count       int                      `json:"count,omitempty"`
-	Skipped     int                      `json:"skipped,omitempty"`
-	ResultFile  string                   `json:"result_file,omitempty"`
-	Result      *scanner.CollisionResult `json:"result,omitempty"`
-	ResultIndex int                      `json:"result_index"`
-	Log         string                   `json:"log,omitempty"`
-	LogIndex    int                      `json:"log_index"`
+	Type       string `json:"type"`
+	Status     string `json:"status,omitempty"`
+	Error      string `json:"error,omitempty"`
+	Total      int    `json:"total,omitempty"`
+	Count      int    `json:"count,omitempty"`
+	Skipped    int    `json:"skipped,omitempty"`
+	ResultFile string `json:"result_file,omitempty"`
+	Log        string `json:"log,omitempty"`
+	LogIndex   int    `json:"log_index"`
 }
 
 const (
@@ -98,26 +136,55 @@ const (
 	maxStatusLimit     = 500
 	maxScanSessions    = 20
 	scanSessionTTL     = 30 * time.Minute
+	maxSessionLogs     = 1000
+	maxRecentResults   = maxStatusLimit
+	progressEventStep  = 100
+	progressEventEvery = 250 * time.Millisecond
 )
 
 // StartNativeGUI starts the cross-platform browser GUI.
-func StartNativeGUI() {
+func StartNativeGUI(options ...GUIOptions) {
+	var guiOptions GUIOptions
+	if len(options) > 0 {
+		guiOptions = options[0]
+	}
+
 	timeoutLog, err := newGUIFileLog("timeout.log")
 	if err != nil {
 		fmt.Printf("[!] Could not open GUI timeout log file: %v\n", err)
 	}
-	defer timeoutLog.Close()
+	if timeoutLog != nil {
+		defer timeoutLog.Close()
+	}
 
-	manager := newScanManager(timeoutLog)
+	guiLog, err := newGUIFileLog("hostcollision-gui.log")
+	if err != nil {
+		fmt.Printf("[!] Could not open GUI execution log file: %v\n", err)
+	}
+	if guiLog != nil {
+		defer guiLog.Close()
+	}
+
+	manager := newScanManager(timeoutLog, guiLog)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", serveIndex)
 	mux.HandleFunc("/scan", manager.serveScan)
+	mux.HandleFunc("/scan/stop", manager.serveScanStop)
+	mux.HandleFunc("/scan/pause", manager.serveScanPause)
+	mux.HandleFunc("/scan/resume", manager.serveScanResume)
 	mux.HandleFunc("/scan/status", manager.serveScanStatus)
+	mux.HandleFunc("/scan/results", manager.serveScanResults)
+	mux.HandleFunc("/scan/download", manager.serveScanDownload)
 	mux.HandleFunc("/scan/events", manager.serveScanEvents)
+
+	var handler http.Handler = mux
+	if guiOptions.Username != "" || guiOptions.Password != "" {
+		handler = basicAuth(handler, guiOptions.Username, guiOptions.Password)
+	}
 
 	server := &http.Server{
 		Addr:              "127.0.0.1:0",
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -134,6 +201,9 @@ func StartNativeGUI() {
 	}()
 
 	fmt.Printf("[*] GUI is running at %s\n", url)
+	if guiOptions.Username != "" || guiOptions.Password != "" {
+		fmt.Println("[*] GUI authentication is enabled")
+	}
 	if err := openBrowser(url); err != nil {
 		fmt.Printf("[!] Could not open browser automatically: %v\n", err)
 		fmt.Printf("[*] Open this URL manually: %s\n", url)
@@ -142,10 +212,11 @@ func StartNativeGUI() {
 	select {}
 }
 
-func newScanManager(timeoutLog *guiFileLog) *scanManager {
+func newScanManager(timeoutLog *guiFileLog, guiLog *guiFileLog) *scanManager {
 	return &scanManager{
 		sessions:   make(map[string]*scanSession),
 		timeoutLog: timeoutLog,
+		guiLog:     guiLog,
 	}
 }
 
@@ -157,6 +228,20 @@ func serveIndex(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(indexHTML))
+}
+
+func basicAuth(next http.Handler, username string, password string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUsername, gotPassword, ok := r.BasicAuth()
+		userOK := subtle.ConstantTimeCompare([]byte(gotUsername), []byte(username)) == 1
+		passOK := subtle.ConstantTimeCompare([]byte(gotPassword), []byte(password)) == 1
+		if !ok || !userOK || !passOK {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Host Collision"`)
+			http.Error(w, "authentication required", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (m *scanManager) serveScan(w http.ResponseWriter, r *http.Request) {
@@ -185,7 +270,9 @@ func (m *scanManager) serveScan(w http.ResponseWriter, r *http.Request) {
 		Path:    req.Path,
 		Headers: parsedHeaders,
 	}
-	scn := scanner.NewScanner(config)
+	if len(config.Ports) == 0 {
+		config.Ports = []int{80, 443}
+	}
 
 	ips, err := scanner.ExpandIPInputs(parseLines(req.IPs))
 	if err != nil {
@@ -199,24 +286,22 @@ func (m *scanManager) serveScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	session := m.newSession(len(ips) * len(targets) * len(config.Ports))
-	if err := session.openResultWriter(); err != nil {
-		session.addLog("[!] Could not open GUI result CSV: " + err.Error())
-	} else {
-		session.addLog("[*] Result CSV: " + session.resultFile)
+	session := m.newSession(cloneScanConfig(config), ips, targets, len(config.Ports))
+	if err := session.openCheckpoint(false); err != nil {
+		session.finish("failed", "could not open GUI checkpoint: "+err.Error(), 0, true)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	scn.SetStoreResults(false)
-	scn.SetResultCallback(session.addResult)
-	scn.SetLogCallback(session.addLog)
-	scn.SetTimeoutCallback(func(result *scanner.CollisionResult) {
-		line := scanner.FormatTimeoutResult(result)
-		if err := m.writeTimeoutLog(line); err != nil {
-			session.addLog("[!] Could not write timeout log: " + err.Error())
-		}
-	})
 	session.addLog("[*] Timeout/no-status log: timeout.log")
+	session.addLog("[*] GUI execution log: hostcollision-gui.log")
+	session.addLog("[*] GUI checkpoint: " + session.checkpointFile)
+	session.addLog("[*] Browser log is summarized for large scans; full results are saved to the task CSV")
 
-	go session.run(scn, ips, targets, len(config.Ports))
+	if err := m.startSessionRun(session, false); err != nil {
+		session.finish("failed", err.Error(), 0, true)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(scanStartResponse{
@@ -225,6 +310,103 @@ func (m *scanManager) serveScan(w http.ResponseWriter, r *http.Request) {
 		Total:      session.total,
 		ResultFile: session.resultFile,
 	})
+}
+
+func (m *scanManager) startSessionRun(session *scanSession, appendResults bool) error {
+	if err := session.openResultWriter(appendResults); err != nil {
+		session.addLog("[!] Could not open GUI result CSV: " + err.Error())
+		return err
+	}
+	session.addLog("[*] Result CSV: " + session.resultFile)
+
+	scn := scanner.NewScanner(session.scanConfig())
+	scn.SetStoreResults(false)
+	scn.SetSkipCallback(session.shouldSkipCheckpoint)
+	scn.SetResultCallback(session.addResult)
+	scn.SetLogCallback(session.addFileLog)
+	scn.SetTimeoutCallback(func(result *scanner.CollisionResult) {
+		line := scanner.FormatTimeoutResult(result)
+		if err := m.writeTimeoutLog(line); err != nil {
+			session.addLog("[!] Could not write timeout log: " + err.Error())
+		}
+		if err := session.markCheckpoint(result); err != nil {
+			session.addLog("[!] Could not write checkpoint: " + err.Error())
+		}
+		session.noteTimeoutLog(result)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	session.startRunning(cancel)
+	go session.run(ctx, scn)
+	return nil
+}
+
+func (m *scanManager) serveScanStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	id := r.URL.Query().Get("id")
+	if id == "" {
+		http.Error(w, "missing scan id", http.StatusBadRequest)
+		return
+	}
+
+	session := m.getSession(id)
+	if session == nil {
+		http.Error(w, "scan session not found", http.StatusNotFound)
+		return
+	}
+
+	session.stop("requested from browser")
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(session.snapshot(0, 0, 0, 0))
+}
+
+func (m *scanManager) serveScanPause(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session := m.getSession(r.URL.Query().Get("id"))
+	if session == nil {
+		http.Error(w, "scan session not found", http.StatusNotFound)
+		return
+	}
+
+	session.pause("requested from browser")
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(session.snapshot(0, 0, 0, 0))
+}
+
+func (m *scanManager) serveScanResume(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session := m.getSession(r.URL.Query().Get("id"))
+	if session == nil {
+		http.Error(w, "scan session not found", http.StatusNotFound)
+		return
+	}
+	if !session.canResume() {
+		http.Error(w, "scan session is not paused", http.StatusConflict)
+		return
+	}
+	if err := m.startSessionRun(session, true); err != nil {
+		session.finish("failed", err.Error(), session.skippedCount(), true)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	session.addLog("[*] GUI scan resumed from checkpoint")
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(session.snapshot(0, 0, 0, 0))
 }
 
 func (m *scanManager) serveScanStatus(w http.ResponseWriter, r *http.Request) {
@@ -252,6 +434,55 @@ func (m *scanManager) serveScanStatus(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(session.snapshot(resultOffset, resultLimit, logOffset, logLimit))
+}
+
+func (m *scanManager) serveScanResults(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session := m.getSession(r.URL.Query().Get("id"))
+	if session == nil {
+		http.Error(w, "scan session not found", http.StatusNotFound)
+		return
+	}
+
+	page := parseNonNegativeInt(r.URL.Query().Get("page"), 0)
+	pageSize := parseBoundedPositiveInt(r.URL.Query().Get("page_size"), defaultStatusLimit, maxStatusLimit)
+	sortKey := normalizeResultSort(r.URL.Query().Get("sort"))
+	direction := normalizeSortDirection(r.URL.Query().Get("dir"))
+
+	response, err := session.resultPage(page, pageSize, sortKey, direction)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (m *scanManager) serveScanDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	session := m.getSession(r.URL.Query().Get("id"))
+	if session == nil {
+		http.Error(w, "scan session not found", http.StatusNotFound)
+		return
+	}
+
+	resultFile := session.resultFilename()
+	if resultFile == "" {
+		http.Error(w, "result file not available", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", resultFile))
+	http.ServeFile(w, r, resultFile)
 }
 
 func (m *scanManager) serveScanEvents(w http.ResponseWriter, r *http.Request) {
@@ -302,23 +533,27 @@ func (m *scanManager) serveScanEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			flusher.Flush()
-			if event.Type == "finished" || event.Type == "failed" {
+			if event.Type == "finished" || event.Type == "failed" || event.Type == "stopped" || event.Type == "paused" {
 				return
 			}
 		}
 	}
 }
 
-func (m *scanManager) newSession(total int) *scanSession {
+func (m *scanManager) newSession(config *scanner.Config, ips []string, targets []scanner.HostTarget, portCount int) *scanSession {
 	now := time.Now()
 	session := &scanSession{
 		id:          newSessionID(),
 		status:      "running",
-		total:       total,
-		results:     make([]*scanner.CollisionResult, 0),
+		total:       len(ips) * len(targets) * portCount,
 		logs:        make([]string, 0),
+		config:      config,
+		ips:         append([]string(nil), ips...),
+		targets:     append([]scanner.HostTarget(nil), targets...),
+		portCount:   portCount,
 		subscribers: make(map[chan scanEvent]struct{}),
 		startedAt:   now,
+		guiLog:      m.guiLog,
 	}
 
 	m.mu.Lock()
@@ -340,6 +575,13 @@ func (m *scanManager) writeTimeoutLog(line string) error {
 		return nil
 	}
 	return m.timeoutLog.Write(line)
+}
+
+func writeGUIExecutionLog(logFile *guiFileLog, taskID string, line string) {
+	if logFile == nil {
+		return
+	}
+	_ = logFile.Write(fmt.Sprintf("task=%s %s", taskID, line))
 }
 
 func (m *scanManager) pruneLocked(now time.Time) {
@@ -369,68 +611,240 @@ func (m *scanManager) pruneLocked(now time.Time) {
 	}
 }
 
-func (s *scanSession) run(scn *scanner.Scanner, ips []string, targets []scanner.HostTarget, portCount int) {
+func (s *scanSession) run(ctx context.Context, scn *scanner.Scanner) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			s.finish("failed", fmt.Sprintf("%v", recovered), scn.GetSkippedCount())
+			s.finish("failed", fmt.Sprintf("%v", recovered), scn.GetSkippedCount(), true)
 		}
 	}()
 
+	ips, targets, portCount := s.scanInputs()
 	s.addLog(fmt.Sprintf("[*] GUI scan started | IPs: %d | Hosts: %d | Ports: %d", len(ips), len(targets), portCount))
-	scn.ScanHostTargets(ips, targets)
+	scn.ScanHostTargetsContext(ctx, ips, targets)
+	switch {
+	case ctx.Err() != nil && s.isPausing():
+		s.addLog(fmt.Sprintf("[*] GUI scan paused, %d results, %d timeout/no-status, %d skipped", scn.GetResultCount(), scn.GetTimeoutCount(), scn.GetSkippedCount()))
+		s.finish("paused", "", scn.GetSkippedCount(), false)
+		return
+	case ctx.Err() != nil || s.isStopping():
+		s.addLog(fmt.Sprintf("[!] GUI scan stopped, %d results, %d timeout/no-status, %d skipped", scn.GetResultCount(), scn.GetTimeoutCount(), scn.GetSkippedCount()))
+		s.finish("stopped", "", scn.GetSkippedCount(), true)
+		return
+	}
 	s.addLog(fmt.Sprintf("[*] GUI scan finished, %d results, %d timeout/no-status, %d skipped", scn.GetResultCount(), scn.GetTimeoutCount(), scn.GetSkippedCount()))
-	s.finish("finished", "", scn.GetSkippedCount())
+	s.finish("finished", "", scn.GetSkippedCount(), true)
+}
+
+func (s *scanSession) startRunning(cancel context.CancelFunc) {
+	s.mu.Lock()
+	s.status = "running"
+	s.err = ""
+	s.cancel = cancel
+	s.finishedAt = nil
+	s.broadcastLocked(s.stateEventLocked("progress"))
+	s.mu.Unlock()
+}
+
+func (s *scanSession) stop(reason string) {
+	s.mu.Lock()
+	if s.status == "paused" {
+		s.status = "stopped"
+		s.finishedAt = timePtr(time.Now())
+		s.cancel = nil
+		s.broadcastLocked(s.stateEventLocked("stopped"))
+		s.mu.Unlock()
+		s.addLog("[!] Stop paused scan " + reason)
+		s.closeCheckpoint()
+		return
+	}
+	if s.status != "running" && s.status != "pausing" {
+		s.mu.Unlock()
+		return
+	}
+	s.status = "stopping"
+	cancel := s.cancel
+	event := s.stateEventLocked("stopping")
+	s.broadcastLocked(event)
+	s.mu.Unlock()
+
+	s.addLog("[!] Stop scan " + reason)
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *scanSession) pause(reason string) {
+	s.mu.Lock()
+	if s.status != "running" {
+		s.mu.Unlock()
+		return
+	}
+	s.status = "pausing"
+	cancel := s.cancel
+	event := s.stateEventLocked("pausing")
+	s.broadcastLocked(event)
+	s.mu.Unlock()
+
+	s.addLog("[*] Pause scan " + reason)
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *scanSession) isStopping() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.status == "stopping"
+}
+
+func (s *scanSession) isPausing() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.status == "pausing"
+}
+
+func (s *scanSession) canResume() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.status == "paused"
+}
+
+func (s *scanSession) skippedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.skipped
 }
 
 func (s *scanSession) addResult(result *scanner.CollisionResult) {
 	if err := s.writeResult(result); err != nil {
 		s.addLog("[!] Could not write result CSV: " + err.Error())
 	}
+	if err := s.markCheckpoint(result); err != nil {
+		s.addLog("[!] Could not write checkpoint: " + err.Error())
+	}
 
 	s.mu.Lock()
-	index := len(s.results)
-	s.results = append(s.results, result)
-	event := s.stateEventLocked("result")
-	event.Result = result
-	event.ResultIndex = index
-	s.broadcastLocked(event)
+	s.resultCount++
+	s.recentResults = append(s.recentResults, result)
+	if len(s.recentResults) > maxRecentResults {
+		drop := len(s.recentResults) - maxRecentResults
+		s.recentResults = append([]*scanner.CollisionResult(nil), s.recentResults[drop:]...)
+		s.recentStartIndex += drop
+	}
+	if s.shouldBroadcastProgressLocked(time.Now()) {
+		s.broadcastLocked(s.stateEventLocked("progress"))
+	}
 	s.mu.Unlock()
 }
 
 func (s *scanSession) addLog(line string) {
 	s.mu.Lock()
-	index := len(s.logs)
+	index := s.logBaseIndex + len(s.logs)
 	s.logs = append(s.logs, line)
+	if len(s.logs) > maxSessionLogs {
+		drop := len(s.logs) - maxSessionLogs
+		s.logs = append([]string(nil), s.logs[drop:]...)
+		s.logBaseIndex += drop
+	}
 	event := s.stateEventLocked("log")
 	event.Log = line
 	event.LogIndex = index
 	s.broadcastLocked(event)
+	id := s.id
+	guiLog := s.guiLog
 	s.mu.Unlock()
+
+	writeGUIExecutionLog(guiLog, id, line)
 }
 
-func (s *scanSession) finish(status string, err string, skipped int) {
+func (s *scanSession) addFileLog(line string) {
+	s.mu.Lock()
+	id := s.id
+	guiLog := s.guiLog
+	s.mu.Unlock()
+
+	writeGUIExecutionLog(guiLog, id, line)
+}
+
+func (s *scanSession) noteTimeoutLog(result *scanner.CollisionResult) {
+	now := time.Now()
+
+	s.mu.Lock()
+	s.timeoutLogCount++
+	count := s.timeoutLogCount
+	shouldLog := count <= 20 || count%500 == 0 || now.Sub(s.lastTimeoutLogAt) >= 5*time.Second
+	if shouldLog {
+		s.lastTimeoutLogAt = now
+	}
+	s.mu.Unlock()
+
+	if !shouldLog {
+		return
+	}
+
+	if result == nil {
+		s.addLog(fmt.Sprintf("[~] %d timeout/no-status entries written to timeout.log", count))
+		return
+	}
+	s.addLog(fmt.Sprintf("[~] %d timeout/no-status entries written to timeout.log | latest %s:%d%s -> Host: %s", count, result.IP, result.Port, result.Path, result.Host))
+}
+
+func (s *scanSession) shouldBroadcastProgressLocked(now time.Time) bool {
+	if s.resultCount == 0 {
+		return false
+	}
+	if s.resultCount-s.lastProgressCount >= progressEventStep || now.Sub(s.lastProgressAt) >= progressEventEvery {
+		s.lastProgressCount = s.resultCount
+		s.lastProgressAt = now
+		return true
+	}
+	return false
+}
+
+func (s *scanSession) finish(status string, err string, skipped int, closeCheckpoint bool) {
 	now := time.Now()
 
 	s.mu.Lock()
 	s.status = status
 	s.err = err
 	s.skipped = skipped
-	s.finishedAt = &now
+	if status == "paused" {
+		s.finishedAt = nil
+	} else {
+		s.finishedAt = &now
+	}
+	s.lastProgressCount = s.resultCount
+	s.lastProgressAt = now
+	s.cancel = nil
 	s.broadcastLocked(s.stateEventLocked(status))
 	resultWriter := s.resultWriter
 	s.resultWriter = nil
 	s.mu.Unlock()
 
 	if resultWriter != nil {
+		s.resultMu.Lock()
 		if closeErr := resultWriter.Close(); closeErr != nil {
+			s.resultMu.Unlock()
 			s.addLog("[!] Could not close result CSV: " + closeErr.Error())
+		} else {
+			s.resultMu.Unlock()
 		}
+	}
+	if closeCheckpoint {
+		s.closeCheckpoint()
 	}
 }
 
-func (s *scanSession) openResultWriter() error {
-	filename := "hostcollision-gui-" + s.id + ".csv"
-	writer, err := scanner.NewResultWriter(filename)
+func (s *scanSession) openResultWriter(appendResults bool) error {
+	filename := s.resultFilename()
+	if filename == "" {
+		filename = "hostcollision-gui-" + s.id + ".csv"
+	}
+	writer, err := scanner.NewResultWriterWithOptions(filename, scanner.ResultWriterOptions{Append: appendResults})
 	if err != nil {
 		return err
 	}
@@ -450,7 +864,185 @@ func (s *scanSession) writeResult(result *scanner.CollisionResult) error {
 	if writer == nil {
 		return nil
 	}
+
+	s.resultMu.Lock()
+	defer s.resultMu.Unlock()
+
 	return writer.Write(result)
+}
+
+func (s *scanSession) openCheckpoint(resume bool) error {
+	filename := s.checkpointFilename()
+	progress, err := scanner.NewCheckpoint(filename, resume)
+	if err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.checkpointFile = filename
+	s.checkpoint = progress
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *scanSession) checkpointFilename() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.checkpointFile != "" {
+		return s.checkpointFile
+	}
+	return "hostcollision-gui-" + s.id + ".checkpoint"
+}
+
+func (s *scanSession) shouldSkipCheckpoint(ip string, port int, target scanner.HostTarget) bool {
+	s.mu.Lock()
+	progress := s.checkpoint
+	s.mu.Unlock()
+
+	return progress != nil && progress.ShouldSkip(ip, port, target)
+}
+
+func (s *scanSession) markCheckpoint(result *scanner.CollisionResult) error {
+	s.mu.Lock()
+	progress := s.checkpoint
+	s.mu.Unlock()
+
+	if progress == nil {
+		return nil
+	}
+	return progress.MarkResult(result)
+}
+
+func (s *scanSession) closeCheckpoint() {
+	s.mu.Lock()
+	progress := s.checkpoint
+	s.checkpoint = nil
+	s.mu.Unlock()
+
+	if progress != nil {
+		_ = progress.Close()
+	}
+}
+
+func (s *scanSession) scanConfig() *scanner.Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return cloneScanConfig(s.config)
+}
+
+func (s *scanSession) scanInputs() ([]string, []scanner.HostTarget, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return append([]string(nil), s.ips...), append([]scanner.HostTarget(nil), s.targets...), s.portCount
+}
+
+func (s *scanSession) resultFilename() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.resultFile
+}
+
+func (s *scanSession) resultPage(page int, pageSize int, sortKey string, direction string) (scanResultsResponse, error) {
+	s.mu.Lock()
+	id := s.id
+	status := s.status
+	total := s.total
+	count := s.resultCount
+	resultFile := s.resultFile
+	s.mu.Unlock()
+
+	totalPages := 0
+	if count > 0 {
+		totalPages = (count + pageSize - 1) / pageSize
+	}
+	if totalPages > 0 && page >= totalPages {
+		page = totalPages - 1
+	}
+	if page < 0 {
+		page = 0
+	}
+
+	var results []*scanner.CollisionResult
+	if sortKey == "" {
+		start := page * pageSize
+		end := start + pageSize
+		if end > count {
+			end = count
+		}
+		if cachedResults, ok := s.recentResultPage(start, end); ok {
+			results = cachedResults
+		} else {
+			var err error
+			s.resultMu.Lock()
+			results, err = readResultFilePage(resultFile, page, pageSize)
+			s.resultMu.Unlock()
+			if err != nil {
+				return scanResultsResponse{}, err
+			}
+		}
+	} else {
+		var err error
+		s.resultMu.Lock()
+		results, err = readResultFile(resultFile)
+		s.resultMu.Unlock()
+		if err != nil {
+			return scanResultsResponse{}, err
+		}
+		sortResults(results, sortKey, direction)
+
+		count = len(results)
+		totalPages = 0
+		if count > 0 {
+			totalPages = (count + pageSize - 1) / pageSize
+		}
+		if totalPages > 0 && page >= totalPages {
+			page = totalPages - 1
+		}
+		start := page * pageSize
+		if start > len(results) {
+			start = len(results)
+		}
+		end := start + pageSize
+		if end > len(results) {
+			end = len(results)
+		}
+		results = results[start:end]
+	}
+
+	return scanResultsResponse{
+		ID:         id,
+		Status:     status,
+		Total:      total,
+		Count:      count,
+		Page:       page,
+		PageSize:   pageSize,
+		TotalPages: totalPages,
+		Sort:       sortKey,
+		Direction:  direction,
+		ResultFile: resultFile,
+		Results:    results,
+	}, nil
+}
+
+func (s *scanSession) recentResultPage(start int, end int) ([]*scanner.CollisionResult, bool) {
+	if end <= start {
+		return nil, true
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	recentEnd := s.recentStartIndex + len(s.recentResults)
+	if start < s.recentStartIndex || end > recentEnd {
+		return nil, false
+	}
+	results := make([]*scanner.CollisionResult, end-start)
+	copy(results, s.recentResults[start-s.recentStartIndex:end-s.recentStartIndex])
+	return results, true
 }
 
 func (s *scanSession) subscribe() chan scanEvent {
@@ -472,21 +1064,15 @@ func (s *scanSession) initialEvents() []scanEvent {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	events := make([]scanEvent, 0, 1+len(s.results)+len(s.logs)+1)
+	events := make([]scanEvent, 0, 1+len(s.logs)+1)
 	events = append(events, s.stateEventLocked("snapshot"))
-	for index, result := range s.results {
-		event := s.stateEventLocked("result")
-		event.Result = result
-		event.ResultIndex = index
-		events = append(events, event)
-	}
 	for index, logLine := range s.logs {
 		event := s.stateEventLocked("log")
 		event.Log = logLine
-		event.LogIndex = index
+		event.LogIndex = s.logBaseIndex + index
 		events = append(events, event)
 	}
-	if s.status == "finished" || s.status == "failed" {
+	if s.status == "finished" || s.status == "failed" || s.status == "stopped" || s.status == "paused" {
 		events = append(events, s.stateEventLocked(s.status))
 	}
 	return events
@@ -498,7 +1084,7 @@ func (s *scanSession) stateEventLocked(eventType string) scanEvent {
 		Status:     s.status,
 		Error:      s.err,
 		Total:      s.total,
-		Count:      len(s.results),
+		Count:      s.resultCount,
 		Skipped:    s.skipped,
 		ResultFile: s.resultFile,
 	}
@@ -532,54 +1118,263 @@ func (s *scanSession) snapshot(resultOffset, resultLimit, logOffset, logLimit in
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	results, nextResultOffset := sliceResults(s.results, resultOffset, resultLimit)
-	logs, nextLogOffset := sliceStrings(s.logs, logOffset, logLimit)
+	logs, nextLogOffset := sliceStrings(s.logs, s.logBaseIndex, logOffset, logLimit)
 
 	return scanStatusResponse{
 		ID:               s.id,
 		Status:           s.status,
 		Error:            s.err,
 		Total:            s.total,
-		Count:            len(s.results),
+		Count:            s.resultCount,
 		Skipped:          s.skipped,
-		Results:          results,
+		Results:          nil,
 		ResultOffset:     resultOffset,
-		NextResultOffset: nextResultOffset,
-		ResultCount:      len(s.results),
+		NextResultOffset: s.resultCount,
+		ResultCount:      s.resultCount,
 		Logs:             logs,
-		LogOffset:        logOffset,
+		LogOffset:        nextLogOffset - len(logs),
 		NextLogOffset:    nextLogOffset,
-		LogCount:         len(s.logs),
+		LogCount:         s.logBaseIndex + len(s.logs),
 		ResultFile:       s.resultFile,
 		StartedAt:        s.startedAt,
 		FinishedAt:       s.finishedAt,
 	}
 }
 
-func sliceResults(results []*scanner.CollisionResult, offset, limit int) ([]*scanner.CollisionResult, int) {
-	if offset > len(results) {
-		offset = len(results)
+func sliceStrings(values []string, baseOffset, offset, limit int) ([]string, int) {
+	if offset < baseOffset {
+		offset = baseOffset
 	}
-	end := offset + limit
-	if end > len(results) {
-		end = len(results)
+	maxOffset := baseOffset + len(values)
+	if offset > maxOffset {
+		offset = maxOffset
 	}
-	page := make([]*scanner.CollisionResult, end-offset)
-	copy(page, results[offset:end])
-	return page, end
-}
-
-func sliceStrings(values []string, offset, limit int) ([]string, int) {
-	if offset > len(values) {
-		offset = len(values)
-	}
-	end := offset + limit
+	start := offset - baseOffset
+	end := start + limit
 	if end > len(values) {
 		end = len(values)
 	}
-	page := make([]string, end-offset)
-	copy(page, values[offset:end])
-	return page, end
+	page := make([]string, end-start)
+	copy(page, values[start:end])
+	return page, baseOffset + end
+}
+
+func readResultFilePage(filename string, page int, pageSize int) ([]*scanner.CollisionResult, error) {
+	if filename == "" {
+		return nil, nil
+	}
+
+	file, err := os.Open(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	if _, err := reader.Read(); err != nil {
+		if err == io.EOF {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	start := page * pageSize
+	end := start + pageSize
+	results := make([]*scanner.CollisionResult, 0, pageSize)
+	validIndex := 0
+	for {
+		record, err := reader.Read()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(record) < 14 {
+			continue
+		}
+		if validIndex >= start && validIndex < end {
+			results = append(results, csvRecordToResult(record))
+		}
+		validIndex++
+		if validIndex >= end {
+			break
+		}
+	}
+	return results, nil
+}
+
+func readResultFile(filename string) ([]*scanner.CollisionResult, error) {
+	if filename == "" {
+		return nil, nil
+	}
+
+	file, err := os.Open(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+	if len(records) <= 1 {
+		return nil, nil
+	}
+
+	results := make([]*scanner.CollisionResult, 0, len(records)-1)
+	for _, record := range records[1:] {
+		if len(record) < 14 {
+			continue
+		}
+		results = append(results, csvRecordToResult(record))
+	}
+	return results, nil
+}
+
+func csvRecordToResult(record []string) *scanner.CollisionResult {
+	port, _ := strconv.Atoi(record[1])
+	statusCode, _ := strconv.Atoi(record[6])
+	contentLength, _ := strconv.Atoi(record[8])
+	responseTime, _ := strconv.ParseInt(record[11], 10, 64)
+	isValid, _ := strconv.ParseBool(record[12])
+
+	return &scanner.CollisionResult{
+		IP:           record[0],
+		Port:         port,
+		Host:         record[2],
+		Input:        record[3],
+		Path:         record[4],
+		URL:          record[5],
+		StatusCode:   statusCode,
+		Title:        record[7],
+		ContentLen:   contentLength,
+		Server:       record[9],
+		UserAgent:    record[10],
+		ResponseTime: responseTime,
+		IsValid:      isValid,
+		Error:        record[13],
+	}
+}
+
+func sortResults(results []*scanner.CollisionResult, sortKey string, direction string) {
+	desc := direction == "desc"
+	sort.SliceStable(results, func(i, j int) bool {
+		cmp := compareResults(results[i], results[j], sortKey)
+		if desc {
+			return cmp > 0
+		}
+		return cmp < 0
+	})
+}
+
+func compareResults(a *scanner.CollisionResult, b *scanner.CollisionResult, sortKey string) int {
+	switch sortKey {
+	case "is_valid":
+		return compareBool(a.IsValid, b.IsValid)
+	case "ip":
+		return strings.Compare(a.IP, b.IP)
+	case "port":
+		return compareInt(a.Port, b.Port)
+	case "host":
+		return strings.Compare(a.Host, b.Host)
+	case "path":
+		return strings.Compare(a.Path, b.Path)
+	case "url":
+		return strings.Compare(a.URL, b.URL)
+	case "user_agent":
+		return strings.Compare(a.UserAgent, b.UserAgent)
+	case "status_code":
+		return compareInt(a.StatusCode, b.StatusCode)
+	case "title":
+		return strings.Compare(a.Title, b.Title)
+	case "content_length":
+		return compareInt(a.ContentLen, b.ContentLen)
+	case "server":
+		return strings.Compare(a.Server, b.Server)
+	case "response_time_ms":
+		return compareInt64(a.ResponseTime, b.ResponseTime)
+	case "error":
+		return strings.Compare(a.Error, b.Error)
+	default:
+		return 0
+	}
+}
+
+func compareBool(a bool, b bool) int {
+	return compareInt(boolToInt(a), boolToInt(b))
+}
+
+func boolToInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func compareInt(a int, b int) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func compareInt64(a int64, b int64) int {
+	switch {
+	case a < b:
+		return -1
+	case a > b:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func normalizeResultSort(value string) string {
+	switch value {
+	case "is_valid", "ip", "port", "host", "path", "url", "user_agent", "status_code", "title", "content_length", "server", "response_time_ms", "error":
+		return value
+	default:
+		return ""
+	}
+}
+
+func normalizeSortDirection(value string) string {
+	if strings.EqualFold(value, "desc") {
+		return "desc"
+	}
+	return "asc"
+}
+
+func cloneScanConfig(config *scanner.Config) *scanner.Config {
+	if config == nil {
+		return &scanner.Config{}
+	}
+	cloned := *config
+	cloned.Ports = append([]int(nil), config.Ports...)
+	if config.Headers != nil {
+		cloned.Headers = make(map[string]string, len(config.Headers))
+		for name, value := range config.Headers {
+			cloned.Headers[name] = value
+		}
+	}
+	return &cloned
+}
+
+func timePtr(value time.Time) *time.Time {
+	return &value
 }
 
 func writeScanEvent(w http.ResponseWriter, event scanEvent) error {
@@ -818,9 +1613,20 @@ const indexHTML = `<!doctype html>
       box-shadow: 0 0 0 3px rgba(15, 118, 110, 0.12);
     }
     .actions {
-      display: flex;
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
       gap: 10px;
       margin-top: 16px;
+    }
+    .actions button {
+      width: 100%;
+      padding: 0 8px;
+    }
+    .actions button:nth-child(-n + 3) {
+      grid-column: span 2;
+    }
+    .actions button:nth-child(n + 4) {
+      grid-column: span 3;
     }
     button {
       min-height: 38px;
@@ -839,7 +1645,6 @@ const indexHTML = `<!doctype html>
       font-size: 12px;
     }
     button.primary {
-      flex: 1;
       border-color: var(--accent);
       background: var(--accent);
       color: #fff;
@@ -871,6 +1676,12 @@ const indexHTML = `<!doctype html>
       text-align: center;
       color: var(--muted);
       font-size: 13px;
+    }
+    .page-jump {
+      width: 72px;
+      min-height: 30px;
+      padding: 0 8px;
+      font-size: 12px;
     }
     .table-wrap {
       width: 100%;
@@ -1058,6 +1869,9 @@ demo.com</textarea>
       </div>
       <div class="actions">
         <button id="scan" class="primary">Start Scan</button>
+        <button id="pause-scan" disabled>Pause Scan</button>
+        <button id="resume-scan" disabled>Resume Scan</button>
+        <button id="stop-scan" disabled>Stop Scan</button>
         <button id="clear">Clear</button>
       </div>
     </aside>
@@ -1065,9 +1879,13 @@ demo.com</textarea>
       <div class="toolbar">
         <div id="summary" class="summary">No results</div>
         <div class="result-actions">
+          <button id="first-page" disabled>First</button>
           <button id="prev-page" disabled>Prev</button>
           <span id="page-label" class="page-label">Page 0/0</span>
+          <input id="page-input" class="page-jump" type="number" min="1" value="1" aria-label="Page number">
+          <button id="go-page" disabled>Go</button>
           <button id="next-page" disabled>Next</button>
+          <button id="last-page" disabled>Last</button>
           <button id="download-json" disabled>JSON</button>
           <button id="download-csv" disabled>CSV</button>
         </div>
@@ -1119,6 +1937,9 @@ demo.com</textarea>
       timeout: document.getElementById('timeout'),
       ports: document.getElementById('ports'),
       scan: document.getElementById('scan'),
+      pause: document.getElementById('pause-scan'),
+      resume: document.getElementById('resume-scan'),
+      stop: document.getElementById('stop-scan'),
       clear: document.getElementById('clear'),
       status: document.getElementById('status'),
       summary: document.getElementById('summary'),
@@ -1126,21 +1947,30 @@ demo.com</textarea>
       table: document.getElementById('table'),
       rows: document.getElementById('rows'),
       logs: document.getElementById('logs'),
+      firstPage: document.getElementById('first-page'),
       prevPage: document.getElementById('prev-page'),
       nextPage: document.getElementById('next-page'),
+      lastPage: document.getElementById('last-page'),
       pageLabel: document.getElementById('page-label'),
+      pageInput: document.getElementById('page-input'),
+      goPage: document.getElementById('go-page'),
       json: document.getElementById('download-json'),
       csv: document.getElementById('download-csv'),
       sortHeaders: Array.from(document.querySelectorAll('th[data-sort]')),
     };
-    let lastResults = [];
+    let pageResults = [];
+    let resultCount = 0;
+    let totalPages = 0;
     let logLines = [];
     let currentPage = 0;
     let currentSession = null;
     let pollTimer = null;
+    let resultTimer = null;
     let eventSource = null;
+    let resultsRequestSeq = 0;
     let sortState = { key: '', direction: 'asc' };
     const pageSize = 100;
+    const maxLogLines = 1000;
     const loadedFiles = { ips: '', hosts: '' };
     const maxPreviewChars = 20000;
 
@@ -1167,25 +1997,6 @@ demo.com</textarea>
       }[ch]));
     }
 
-    function sortedResults() {
-      const rows = lastResults.filter(Boolean);
-      if (!sortState.key) {
-        return rows;
-      }
-
-      const direction = sortState.direction === 'desc' ? -1 : 1;
-      return rows.slice().sort((a, b) => compareRows(a, b, sortState.key) * direction);
-    }
-
-    function compareRows(a, b, key) {
-      const av = a[key];
-      const bv = b[key];
-      if (typeof av === 'number' || typeof bv === 'number' || typeof av === 'boolean' || typeof bv === 'boolean') {
-        return Number(av || 0) - Number(bv || 0);
-      }
-      return String(av ?? '').localeCompare(String(bv ?? ''), undefined, { numeric: true, sensitivity: 'base' });
-    }
-
     function updateSortHeaders() {
       els.sortHeaders.forEach(th => {
         th.classList.toggle('sort-asc', sortState.key === th.dataset.sort && sortState.direction === 'asc');
@@ -1194,13 +2005,11 @@ demo.com</textarea>
     }
 
     function renderPage() {
-      const displayResults = sortedResults();
-      const total = displayResults.length;
-      const maxPage = Math.max(0, Math.ceil(total / pageSize) - 1);
+      const total = resultCount;
+      const maxPage = Math.max(0, totalPages - 1);
       currentPage = Math.min(currentPage, maxPage);
-      const pageRows = total === 0 ? [] : displayResults.slice(currentPage * pageSize, currentPage * pageSize + pageSize);
 
-      els.rows.innerHTML = pageRows.map(row => {
+      els.rows.innerHTML = pageResults.map(row => {
         const validClass = row.is_valid ? 'valid' : 'invalid';
         const validText = row.is_valid ? 'Yes' : 'No';
         return '<tr>' +
@@ -1223,32 +2032,53 @@ demo.com</textarea>
       els.empty.hidden = total > 0;
       els.table.hidden = total === 0;
       els.pageLabel.textContent = total === 0 ? 'Page 0/0' : 'Page ' + (currentPage + 1) + '/' + (maxPage + 1);
+      els.pageInput.disabled = total === 0;
+      els.pageInput.max = String(maxPage + 1);
+      els.pageInput.value = total === 0 ? '1' : String(currentPage + 1);
+      els.firstPage.disabled = total === 0 || currentPage === 0;
       els.prevPage.disabled = total === 0 || currentPage === 0;
       els.nextPage.disabled = total === 0 || currentPage >= maxPage;
+      els.lastPage.disabled = total === 0 || currentPage >= maxPage;
+      els.goPage.disabled = total === 0;
       els.json.disabled = total === 0;
       els.csv.disabled = total === 0;
       updateSortHeaders();
     }
 
     function render(results) {
-      lastResults = results;
+      pageResults = results;
       currentPage = 0;
       renderPage();
       updateSummary();
     }
 
     function updateSummary(statusData) {
-      const resultCount = lastResults.filter(Boolean).length;
       const total = statusData && statusData.total ? statusData.total : 0;
       const status = statusData ? statusData.status : '';
       const resultFile = statusData && statusData.result_file ? ' | CSV: ' + statusData.result_file : '';
       if (status === 'running') {
         els.summary.textContent = (total > 0 ? 'Scanning: ' + resultCount + '/' + total + ' probes' : 'Scanning: ' + resultCount + ' results') + resultFile;
+      } else if (status === 'pausing') {
+        els.summary.textContent = 'Pausing: ' + resultCount + ' results' + resultFile;
+      } else if (status === 'paused') {
+        els.summary.textContent = 'Paused: ' + resultCount + ' results' + resultFile;
+      } else if (status === 'stopping') {
+        els.summary.textContent = 'Stopping: ' + resultCount + ' results' + resultFile;
+      } else if (status === 'stopped') {
+        els.summary.textContent = 'Stopped: ' + resultCount + ' results' + resultFile;
       } else if (status === 'failed') {
         els.summary.textContent = 'Failed: ' + (statusData.error || 'scan failed');
       } else {
         els.summary.textContent = (resultCount === 1 ? '1 result' : resultCount + ' results') + resultFile;
       }
+    }
+
+    function downloadServerFile() {
+      const id = currentSession ? currentSession.id : new URLSearchParams(window.location.search).get('id');
+      if (!id) {
+        return;
+      }
+      window.location.href = '/scan/download?id=' + encodeURIComponent(id);
     }
 
     function setTaskIdentity(id, resultFile) {
@@ -1267,36 +2097,105 @@ demo.com</textarea>
       }
     }
 
-    function setResultAt(index, result) {
-      if (!Number.isInteger(index) || index < 0 || !result) {
-        return false;
-      }
-      const wasOnLatestPage = currentPage >= Math.max(0, Math.ceil(lastResults.filter(Boolean).length / pageSize) - 1);
-      lastResults[index] = result;
-      if (wasOnLatestPage) {
-        currentPage = Math.max(0, Math.ceil(lastResults.filter(Boolean).length / pageSize) - 1);
-      }
-      return true;
-    }
-
     function setLogAt(index, line) {
       if (!Number.isInteger(index) || index < 0) {
         return false;
       }
-      logLines[index] = String(line ?? '');
-      els.logs.textContent = logLines.filter(line => line !== undefined).join('\n');
+      const text = String(line ?? '');
+      const existing = logLines.find(entry => entry.index === index);
+      if (existing) {
+        existing.line = text;
+      } else {
+        logLines.push({ index, line: text });
+        logLines.sort((a, b) => a.index - b.index);
+        if (logLines.length > maxLogLines) {
+          logLines.splice(0, logLines.length - maxLogLines);
+        }
+      }
+      els.logs.textContent = logLines.map(entry => entry.line).join('\n');
       els.logs.scrollTop = els.logs.scrollHeight;
       return true;
     }
 
+    function setScanControls(status) {
+      const running = status === 'running';
+      const paused = status === 'paused';
+      const busy = status === 'starting' || status === 'pausing' || status === 'stopping';
+      els.scan.disabled = running || paused || busy;
+      els.pause.disabled = !running;
+      els.resume.disabled = !paused;
+      els.stop.disabled = !(running || paused || status === 'pausing');
+    }
+
     function appendStatus(data) {
-      if (Array.isArray(data.results) && data.results.length > 0) {
-        const offset = Number.isInteger(data.result_offset) ? data.result_offset : lastResults.length;
-        data.results.forEach((result, i) => setResultAt(offset + i, result));
+      if (currentSession && data.status) {
+        currentSession.status = data.status;
+        setScanControls(data.status);
+      }
+      if (Number.isInteger(data.result_count)) {
+        resultCount = data.result_count;
+      } else if (Number.isInteger(data.count)) {
+        resultCount = data.count;
       }
       if (Array.isArray(data.logs) && data.logs.length > 0) {
         const offset = Number.isInteger(data.log_offset) ? data.log_offset : logLines.length;
         data.logs.forEach((line, i) => setLogAt(offset + i, line));
+      }
+      renderPage();
+      updateSummary(data);
+      scheduleResultFetch(500);
+    }
+
+    function scheduleResultFetch(delay) {
+      if (!currentSession) {
+        return;
+      }
+      if (resultTimer) {
+        return;
+      }
+      resultTimer = setTimeout(() => {
+        resultTimer = null;
+        fetchResultsPage().catch(err => {
+          if (currentSession) {
+            els.status.textContent = 'Result refresh failed';
+            els.summary.textContent = err.message || String(err);
+          }
+        });
+      }, delay);
+    }
+
+    async function fetchResultsPage() {
+      if (!currentSession) {
+        return;
+      }
+      const session = currentSession;
+      const requestSeq = ++resultsRequestSeq;
+      const params = new URLSearchParams({
+        id: session.id,
+        page: String(currentPage),
+        page_size: String(pageSize),
+        sort: sortState.key,
+        dir: sortState.direction,
+      });
+      const res = await fetch('/scan/results?' + params.toString());
+      if (currentSession !== session || requestSeq !== resultsRequestSeq) {
+        return;
+      }
+      if (!res.ok) {
+        throw new Error(await res.text());
+      }
+      const data = await res.json();
+      if (currentSession !== session || requestSeq !== resultsRequestSeq) {
+        return;
+      }
+
+      pageResults = Array.isArray(data.results) ? data.results : [];
+      resultCount = Number.isInteger(data.count) ? data.count : pageResults.length;
+      totalPages = Number.isInteger(data.total_pages) ? data.total_pages : Math.ceil(resultCount / pageSize);
+      currentPage = Number.isInteger(data.page) ? data.page : currentPage;
+      if (data.result_file) {
+        session.resultFile = data.result_file;
+        setTaskIdentity(session.id, session.resultFile);
       }
       renderPage();
       updateSummary(data);
@@ -1306,17 +2205,19 @@ demo.com</textarea>
       if (currentSession !== session) {
         return;
       }
+      if (data.status) {
+        session.status = data.status;
+        setScanControls(data.status);
+      }
       if (data.result_file) {
         session.resultFile = data.result_file;
         setTaskIdentity(session.id, session.resultFile);
       }
-      if (data.type === 'result') {
-        const index = Number.isInteger(data.result_index) ? data.result_index : lastResults.length;
-        setResultAt(index, data.result);
-        if (index === (session.nextResultOffset || 0)) {
-          session.nextResultOffset = index + 1;
-        }
-      } else if (data.type === 'log') {
+      if (Number.isInteger(data.count)) {
+        resultCount = data.count;
+        scheduleResultFetch(500);
+      }
+      if (data.type === 'log') {
         const index = Number.isInteger(data.log_index) ? data.log_index : logLines.length;
         setLogAt(index, data.log);
         if (index === (session.nextLogOffset || 0)) {
@@ -1327,10 +2228,20 @@ demo.com</textarea>
       renderPage();
       updateSummary(data);
 
-      if (data.type === 'finished' || data.type === 'failed') {
+      if (data.type === 'stopping') {
+        setScanControls('stopping');
+        els.status.textContent = 'Stopping';
+      }
+      if (data.type === 'pausing') {
+        setScanControls('pausing');
+        els.status.textContent = 'Pausing';
+      }
+
+      if (data.type === 'finished' || data.type === 'failed' || data.type === 'stopped' || data.type === 'paused') {
         stopPollTimer();
         stopEventStream();
-        els.status.textContent = data.type === 'failed' ? 'Finishing after failure' : 'Finishing';
+        setScanControls(data.type);
+        els.status.textContent = data.type === 'failed' ? 'Finishing after failure' : data.type === 'stopped' ? 'Stopped' : data.type === 'paused' ? 'Paused' : 'Finishing';
         pollStatus();
       }
     }
@@ -1404,7 +2315,28 @@ demo.com</textarea>
         clearTimeout(pollTimer);
         pollTimer = null;
       }
+      if (resultTimer) {
+        clearTimeout(resultTimer);
+        resultTimer = null;
+      }
       stopEventStream();
+    }
+
+    function goToPageFromInput() {
+      if (!currentSession || resultCount === 0) {
+        return;
+      }
+      const maxPage = Math.max(0, totalPages - 1);
+      const requested = Number.parseInt(els.pageInput.value, 10);
+      if (!Number.isFinite(requested)) {
+        els.pageInput.value = String(currentPage + 1);
+        return;
+      }
+      currentPage = Math.min(maxPage, Math.max(0, requested - 1));
+      fetchResultsPage().catch(err => {
+        els.status.textContent = 'Result refresh failed';
+        els.summary.textContent = err.message || String(err);
+      });
     }
 
     function stopPollTimer() {
@@ -1444,7 +2376,7 @@ demo.com</textarea>
         }
       };
 
-      ['snapshot', 'result', 'log', 'finished', 'failed'].forEach(type => {
+      ['snapshot', 'progress', 'log', 'pausing', 'paused', 'stopping', 'stopped', 'finished', 'failed'].forEach(type => {
         source.addEventListener(type, onEvent);
       });
       source.onerror = () => {
@@ -1491,22 +2423,22 @@ demo.com</textarea>
 
         const hasPendingResults = session.nextResultOffset < (data.result_count || 0);
         const hasPendingLogs = session.nextLogOffset < (data.log_count || 0);
-        if (data.status === 'running' || hasPendingResults || hasPendingLogs) {
-          pollTimer = setTimeout(pollStatus, data.status === 'running' ? 250 : 50);
+        setScanControls(data.status);
+        if (data.status === 'running' || data.status === 'pausing' || data.status === 'stopping' || hasPendingResults || hasPendingLogs) {
+          pollTimer = setTimeout(pollStatus, data.status === 'running' || data.status === 'pausing' || data.status === 'stopping' ? 500 : 50);
         } else {
           if (eventSource) {
             eventSource.close();
             eventSource = null;
           }
-          els.scan.disabled = false;
-          els.status.textContent = data.status === 'failed' ? 'Failed' : 'Finished';
-          currentSession = null;
+          setScanControls(data.status);
+          els.status.textContent = data.status === 'failed' ? 'Failed' : data.status === 'stopped' ? 'Stopped' : data.status === 'paused' ? 'Paused' : 'Finished';
         }
       } catch (err) {
         if (currentSession !== session) {
           return;
         }
-        els.scan.disabled = false;
+        setScanControls('');
         els.status.textContent = 'Failed';
         els.summary.textContent = err.message || String(err);
         stopPolling();
@@ -1520,7 +2452,9 @@ demo.com</textarea>
         return;
       }
 
-      lastResults = [];
+      pageResults = [];
+      resultCount = 0;
+      totalPages = 0;
       logLines = [];
       currentPage = 0;
       currentSession = {
@@ -1532,7 +2466,7 @@ demo.com</textarea>
       setTaskIdentity(id, '');
       els.logs.textContent = 'Reconnecting to task ' + id;
       els.status.textContent = 'Reconnecting';
-      els.scan.disabled = true;
+      setScanControls('running');
       renderPage();
       connectEventStream(currentSession);
       pollStatus();
@@ -1540,10 +2474,12 @@ demo.com</textarea>
 
     els.scan.addEventListener('click', async () => {
       stopPolling();
-      els.scan.disabled = true;
+      setScanControls('starting');
       els.status.textContent = 'Starting';
       els.summary.textContent = 'Starting';
-      lastResults = [];
+      pageResults = [];
+      resultCount = 0;
+      totalPages = 0;
       logLines = [];
       currentPage = 0;
       currentSession = null;
@@ -1567,13 +2503,123 @@ demo.com</textarea>
         };
         setTaskIdentity(data.id, data.result_file || '');
         els.status.textContent = 'Scanning';
+        setScanControls('running');
         updateSummary({ status: 'running', total: data.total || 0, result_file: data.result_file || '' });
         connectEventStream(currentSession);
+        fetchResultsPage().catch(err => {
+          els.status.textContent = 'Result refresh failed';
+          els.summary.textContent = err.message || String(err);
+        });
         pollStatus();
       } catch (err) {
         els.status.textContent = 'Failed';
         els.summary.textContent = err.message || String(err);
-        els.scan.disabled = false;
+        setScanControls('');
+      }
+    });
+
+    els.stop.addEventListener('click', async () => {
+      if (!currentSession) {
+        return;
+      }
+      const session = currentSession;
+      els.stop.disabled = true;
+      els.status.textContent = 'Stopping';
+      try {
+        const res = await fetch('/scan/stop?id=' + encodeURIComponent(session.id), { method: 'POST' });
+        if (currentSession !== session) {
+          return;
+        }
+        if (!res.ok) {
+          throw new Error(await res.text());
+        }
+        const data = await res.json();
+        if (currentSession !== session) {
+          return;
+        }
+        appendStatus(data);
+        stopPollTimer();
+        pollStatus();
+      } catch (err) {
+        if (currentSession !== session) {
+          return;
+        }
+        els.status.textContent = 'Stop failed';
+        els.summary.textContent = err.message || String(err);
+        els.stop.disabled = false;
+      }
+    });
+
+    els.pause.addEventListener('click', async () => {
+      if (!currentSession) {
+        return;
+      }
+      const session = currentSession;
+      setScanControls('pausing');
+      els.status.textContent = 'Pausing';
+      try {
+        const res = await fetch('/scan/pause?id=' + encodeURIComponent(session.id), { method: 'POST' });
+        if (currentSession !== session) {
+          return;
+        }
+        if (!res.ok) {
+          throw new Error(await res.text());
+        }
+        const data = await res.json();
+        if (currentSession !== session) {
+          return;
+        }
+        appendStatus(data);
+        stopPollTimer();
+        pollStatus();
+      } catch (err) {
+        if (currentSession !== session) {
+          return;
+        }
+        els.status.textContent = 'Pause failed';
+        els.summary.textContent = err.message || String(err);
+        setScanControls(session.status || 'running');
+      }
+    });
+
+    els.resume.addEventListener('click', async () => {
+      if (!currentSession) {
+        return;
+      }
+      const session = currentSession;
+      setScanControls('starting');
+      els.status.textContent = 'Resuming';
+      try {
+        const res = await fetch('/scan/resume?id=' + encodeURIComponent(session.id), { method: 'POST' });
+        if (currentSession !== session) {
+          return;
+        }
+        if (!res.ok) {
+          throw new Error(await res.text());
+        }
+        const data = await res.json();
+        if (currentSession !== session) {
+          return;
+        }
+        appendStatus(data);
+        els.status.textContent = 'Scanning';
+        setScanControls('running');
+        stopPollTimer();
+        connectEventStream(session);
+        fetchResultsPage().catch(err => {
+          if (currentSession === session) {
+            els.status.textContent = 'Result refresh failed';
+            els.summary.textContent = err.message || String(err);
+          }
+        });
+        pollStatus();
+      } catch (err) {
+        if (currentSession !== session) {
+          return;
+        }
+        els.status.textContent = 'Resume failed';
+        els.summary.textContent = err.message || String(err);
+        setScanControls(session.status || 'paused');
       }
     });
 
@@ -1581,10 +2627,13 @@ demo.com</textarea>
       stopPolling();
       currentSession = null;
       logLines = [];
+      pageResults = [];
+      resultCount = 0;
+      totalPages = 0;
       els.logs.textContent = 'No scan logs';
       render([]);
       setTaskIdentity('', '');
-      els.scan.disabled = false;
+      setScanControls('');
       els.status.textContent = 'Ready';
     });
 
@@ -1608,13 +2657,39 @@ demo.com</textarea>
       els.hosts.value = '';
       els.status.textContent = 'Host list cleared';
     });
+    els.firstPage.addEventListener('click', () => {
+      currentPage = 0;
+      fetchResultsPage().catch(err => {
+        els.status.textContent = 'Result refresh failed';
+        els.summary.textContent = err.message || String(err);
+      });
+    });
     els.prevPage.addEventListener('click', () => {
       currentPage = Math.max(0, currentPage - 1);
-      renderPage();
+      fetchResultsPage().catch(err => {
+        els.status.textContent = 'Result refresh failed';
+        els.summary.textContent = err.message || String(err);
+      });
     });
     els.nextPage.addEventListener('click', () => {
-      currentPage += 1;
-      renderPage();
+      currentPage = Math.min(Math.max(0, totalPages - 1), currentPage + 1);
+      fetchResultsPage().catch(err => {
+        els.status.textContent = 'Result refresh failed';
+        els.summary.textContent = err.message || String(err);
+      });
+    });
+    els.lastPage.addEventListener('click', () => {
+      currentPage = Math.max(0, totalPages - 1);
+      fetchResultsPage().catch(err => {
+        els.status.textContent = 'Result refresh failed';
+        els.summary.textContent = err.message || String(err);
+      });
+    });
+    els.goPage.addEventListener('click', goToPageFromInput);
+    els.pageInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        goToPageFromInput();
+      }
     });
     els.sortHeaders.forEach(th => {
       th.addEventListener('click', () => {
@@ -1625,16 +2700,19 @@ demo.com</textarea>
           sortState = { key, direction: 'asc' };
         }
         currentPage = 0;
-        renderPage();
+        fetchResultsPage().catch(err => {
+          els.status.textContent = 'Result refresh failed';
+          els.summary.textContent = err.message || String(err);
+        });
       });
     });
 
     els.json.addEventListener('click', () => {
-      download('hostcollision-results.json', 'application/json', JSON.stringify(sortedResults(), null, 2));
+      download('hostcollision-current-page.json', 'application/json', JSON.stringify(pageResults, null, 2));
     });
 
     els.csv.addEventListener('click', () => {
-      download('hostcollision-results.csv', 'text/csv', toCSV(sortedResults()));
+      downloadServerFile();
     });
 
     restoreTaskFromURL();

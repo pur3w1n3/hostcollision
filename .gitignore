@@ -9,6 +9,7 @@
 /result.json
 /scan.log
 /timeout.log
+/hostcollision-gui.log
 /hostcollision-gui-*.csv
 /*.checkpoint
 
