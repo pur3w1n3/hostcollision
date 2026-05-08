@@ -65,6 +65,8 @@ GUI 行为：
 
 刷新恢复依赖 GUI 进程仍在运行。如果进程退出，浏览器无法恢复内存任务，但已经落盘的 CSV 仍然可用。
 
+![alt text](images/custom-image.png)
+
 ### CLI 使用
 
 从文件读取 IP 和 Host：
